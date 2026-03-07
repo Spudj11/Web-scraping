@@ -29,6 +29,10 @@ Output columns:
     shopify_store             myshopify.com subdomain (e.g. brandname.myshopify.com)
     instagram_on_website      Instagram handle linked on the brand's own website
     website_confirms_instagram  yes / no / not_checked
+    nykaa_url                 Brand's page on Nykaa (if found)
+    amazon_in_url             Brand's page on Amazon India (if found)
+    flipkart_url              Brand's page on Flipkart (if found)
+    myntra_url                Brand's page on Myntra (if found)
     status                    ok / url_only / not_found
 
 Confidence guide:
@@ -89,12 +93,22 @@ _MARKETPLACE_KEYWORDS = {
     "tracxn", "yourstory", "entrackr", "ambitionbox", "trustpilot",
 }
 
+# Marketplaces to search for the brand's listing page.
+# Each entry: (csv_field_name, site_domain)
+MARKETPLACE_TARGETS = [
+    ("nykaa_url",     "nykaa.com"),
+    ("amazon_in_url", "amazon.in"),
+    ("flipkart_url",  "flipkart.com"),
+    ("myntra_url",    "myntra.com"),
+]
+
 OUTPUT_FIELDS = [
     "brand",
     "instagram_url", "followers",
     "confidence", "confidence_reason",
     "website_url", "platform", "shopify_store",
     "instagram_on_website", "website_confirms_instagram",
+    "nykaa_url", "amazon_in_url", "flipkart_url", "myntra_url",
     "status",
 ]
 
@@ -355,6 +369,52 @@ def find_brand_website(brand_name: str, region: str, rate_limiter: RateLimiter) 
     return _find_website_ddg(query, rate_limiter)
 
 
+def _search_on_site(brand_name: str, site: str, rate_limiter: RateLimiter) -> str | None:
+    """
+    Search DDG for a brand on a specific marketplace domain.
+    Returns the first result URL that belongs to that domain.
+    """
+    query = f'"{brand_name}" site:{site}'
+    url   = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    rate_limiter.wait()
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for result in soup.select("div.result, div.results_links"):
+        link_tag = result.select_one("a.result__a")
+        if not link_tag:
+            continue
+        real_url = _decode_ddg_href(link_tag.get("href", ""))
+        if real_url and site in real_url:
+            return real_url
+
+        # Fallback: display URL span
+        url_span = result.select_one("span.result__url, div.result__url")
+        if url_span:
+            display = url_span.get_text(strip=True).split("›")[0].strip()
+            if site in display:
+                return "https://" + display if not display.startswith("http") else display
+    return None
+
+
+def find_marketplace_urls(brand_name: str, rate_limiter: RateLimiter) -> dict:
+    """
+    Search for the brand's listing page on each configured marketplace.
+    Returns a dict keyed by the CSV field name, e.g.:
+      {"nykaa_url": "https://...", "amazon_in_url": None, ...}
+    """
+    results = {}
+    for field, site in MARKETPLACE_TARGETS:
+        results[field] = _search_on_site(brand_name, site, rate_limiter)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Website analysis — platform detection + Instagram handle extraction
 # ---------------------------------------------------------------------------
@@ -492,16 +552,17 @@ def scrape_brand(
     skip_website: bool,
 ) -> dict:
     base = {
-        "brand":                    brand_name,
-        "instagram_url":            None,
-        "followers":                None,
-        "confidence":               None,
-        "confidence_reason":        None,
-        "website_url":              None,
-        "platform":                 None,
-        "shopify_store":            None,
-        "instagram_on_website":     None,
+        "brand":                      brand_name,
+        "instagram_url":              None,
+        "followers":                  None,
+        "confidence":                 None,
+        "confidence_reason":          None,
+        "website_url":                None,
+        "platform":                   None,
+        "shopify_store":              None,
+        "instagram_on_website":       None,
         "website_confirms_instagram": None,
+        **{field: None for field, _ in MARKETPLACE_TARGETS},
     }
 
     # --- Step 1: find Instagram profile ---
@@ -574,6 +635,9 @@ def scrape_brand(
             row["confidence_reason"] = f"overridden by brand website (@{website_handle})"
     else:
         row["website_confirms_instagram"] = "not_checked"
+
+    # --- Step 4: find marketplace listing pages ---
+    row.update(find_marketplace_urls(brand_name, ddg_rl))
 
     return row
 
@@ -741,17 +805,23 @@ def main():
             s_icon   = "✓" if result["status"] == "ok" else (
                        "~" if result["status"] == "url_only" else "✗")
 
-            platform = result.get("platform") or ""
-            shopify  = f" ({result['shopify_store']})" if result.get("shopify_store") else ""
-            site     = f"  🌐 {result['website_url'][:40]} {platform}{shopify}" \
-                       if result.get("website_url") else ""
+            platform   = result.get("platform") or ""
+            shopify    = f" ({result['shopify_store']})" if result.get("shopify_store") else ""
+            site       = f"  🌐 {result['website_url'][:35]} [{platform}{shopify}]" \
+                         if result.get("website_url") else ""
+            markets    = "  ".join(
+                f"{field.replace('_url','').upper()}✓"
+                for field, _ in MARKETPLACE_TARGETS
+                if result.get(field)
+            )
+            market_str = f"  [{markets}]" if markets else ""
 
             print(
                 f"[{pct:5.1f}%] {completed:>{len(str(total))}}/{total}  "
-                f"ETA {eta_str}  {s_icon}{conf_tag} {result['brand'][:30]}"
+                f"ETA {eta_str}  {s_icon}{conf_tag} {result['brand'][:28]}"
                 f"  →  {result['instagram_url'] or 'not found'}"
                 f"  {result['followers'] or ''}"
-                f"{site}",
+                f"{site}{market_str}",
                 flush=True,
             )
 
