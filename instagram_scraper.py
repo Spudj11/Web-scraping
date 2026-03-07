@@ -213,30 +213,67 @@ def _is_valid_handle(handle: str) -> bool:
 
 
 def _parse_ddg_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
-    for result in soup.select("div.result, div.results_links"):
-        link_tag = result.select_one("a.result__a, a.result__url")
-        if not link_tag:
-            continue
-        href      = link_tag.get("href", "")
-        url_match = INSTAGRAM_URL_PATTERN.search(href)
-        if not url_match or not _is_valid_handle(url_match.group(1)):
-            text_url = INSTAGRAM_URL_PATTERN.search(link_tag.get_text())
-            if not text_url or not _is_valid_handle(text_url.group(1)):
+    # DDG HTML structure varies; try multiple selector combos
+    result_selectors = [
+        "div.result",
+        "div.results_links",
+        "div.web-result",
+        "article[data-testid]",
+    ]
+    link_selectors = [
+        "a.result__a",
+        "a.result__url",
+        "h2 a",
+        "a[href*='instagram.com']",
+    ]
+    snippet_selectors = [
+        "a.result__snippet",
+        "div.result__snippet",
+        "span.result__snippet",
+        "div.result__body",
+        "span[class*='snippet']",
+    ]
+
+    for result_sel in result_selectors:
+        for result in soup.select(result_sel):
+            instagram_url = None
+            for link_sel in link_selectors:
+                link_tag = result.select_one(link_sel)
+                if not link_tag:
+                    continue
+                href = link_tag.get("href", "")
+                # DDG wraps links: extract real URL from uddg= param
+                if "uddg=" in href:
+                    m = re.search(r"uddg=([^&]+)", href)
+                    if m:
+                        href = unquote(m.group(1))
+                url_match = INSTAGRAM_URL_PATTERN.search(href)
+                if not url_match:
+                    url_match = INSTAGRAM_URL_PATTERN.search(link_tag.get_text())
+                if url_match and _is_valid_handle(url_match.group(1)):
+                    instagram_url = f"https://www.instagram.com/{url_match.group(1)}/"
+                    break
+
+            if not instagram_url:
                 continue
-            url_match = text_url
 
-        instagram_url = f"https://www.instagram.com/{url_match.group(1)}/"
-        snippet_tag   = result.select_one(
-            "a.result__snippet, div.result__snippet, span.result__snippet"
-        )
-        snippet         = snippet_tag.get_text(" ", strip=True) if snippet_tag else ""
-        followers_match = FOLLOWERS_PATTERN.search(snippet)
-        return {
-            "instagram_url": instagram_url,
-            "followers":     followers_match.group(1) if followers_match else None,
-            "snippet":       snippet,
-        }
+            snippet = ""
+            for snip_sel in snippet_selectors:
+                snip_tag = result.select_one(snip_sel)
+                if snip_tag:
+                    snippet = snip_tag.get_text(" ", strip=True)
+                    break
+            if not snippet:
+                snippet = result.get_text(" ", strip=True)
 
+            followers_match = FOLLOWERS_PATTERN.search(snippet)
+            return {
+                "instagram_url": instagram_url,
+                "followers":     followers_match.group(1) if followers_match else None,
+                "snippet":       snippet,
+            }
+
+    # Final fallback: scan raw HTML for any instagram.com URL
     for m in INSTAGRAM_URL_PATTERN.finditer(raw_html):
         if _is_valid_handle(m.group(1)):
             fm = FOLLOWERS_PATTERN.search(raw_html)
@@ -544,6 +581,59 @@ MAX_RETRIES   = 3
 RETRY_BACKOFF = [5, 15, 45]
 
 
+def _guess_instagram_handle(brand_name: str) -> list[str]:
+    """
+    Generate likely Instagram handle candidates from the brand name.
+    Returns a list of handles to try, most specific first.
+    """
+    # Normalize: lowercase, only alphanumeric + dots/underscores
+    base = re.sub(r"[^a-z0-9]", "", brand_name.lower())
+    candidates = [base]
+    # Common suffixes brands add to their handles
+    for suffix in ("official", "india", "store", "skincare", "beauty", "hq"):
+        candidates.append(base + suffix)
+    return candidates
+
+
+def _check_instagram_handle(handle: str) -> dict | None:
+    """
+    Verify a handle exists by checking the Instagram profile page.
+    Returns a minimal result dict on success, None if the profile doesn't exist.
+    """
+    url = f"https://www.instagram.com/{handle}/"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        # 404 = profile doesn't exist; anything else (200, 302) = likely exists
+        if resp.status_code == 404:
+            return None
+        if resp.status_code == 200:
+            # Quick follower extract from page source
+            fm = FOLLOWERS_PATTERN.search(resp.text)
+            return {
+                "instagram_url": url,
+                "followers":     fm.group(1) if fm else None,
+                "snippet":       "",
+            }
+    except requests.RequestException:
+        pass
+    return None
+
+
+def _build_ig_queries(brand_name: str, region: str) -> list[str]:
+    """
+    Return a prioritised list of search queries to try for finding
+    a brand's Instagram profile.
+    """
+    r = f" {region}" if region else ""
+    quoted = f'"{brand_name}"'
+    return [
+        f"{brand_name}{r} site:instagram.com",           # narrow site: search
+        f"{brand_name}{r} instagram",                    # broad mention search
+        f"{quoted} instagram official profile{r}",       # quoted + profile keyword
+        f"{brand_name} instagram brand{r}",              # brand keyword
+    ]
+
+
 def scrape_brand(
     brand_name:  str,
     ddg_rl:      RateLimiter,
@@ -566,23 +656,33 @@ def scrape_brand(
     }
 
     # --- Step 1: find Instagram profile ---
-    ig_query = f"{brand_name} {region} site:instagram.com" if region else \
-               f"{brand_name} site:instagram.com"
-
+    # Try multiple query strategies in order; stop at first hit
     ig_result = None
-    for attempt in range(MAX_RETRIES):
-        result = _search_duckduckgo(ig_query, ddg_rl)
-        if result and result.get("_blocked"):
-            time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
-            continue
-        if not result:
-            result = _search_google(ig_query, goog_rl)
-        if result and result.get("_blocked"):
-            time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
-            continue
-        if result:
-            ig_result = result
+    for ig_query in _build_ig_queries(brand_name, region):
+        if ig_result:
             break
+        for attempt in range(MAX_RETRIES):
+            result = _search_duckduckgo(ig_query, ddg_rl)
+            if result and result.get("_blocked"):
+                time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
+                continue
+            if not result:
+                result = _search_google(ig_query, goog_rl)
+            if result and result.get("_blocked"):
+                time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
+                continue
+            if result:
+                ig_result = result
+                break
+
+    # --- Step 1b: direct handle guessing as last resort ---
+    if not ig_result:
+        for handle in _guess_instagram_handle(brand_name):
+            if _is_valid_handle(handle):
+                checked = _check_instagram_handle(handle)
+                if checked:
+                    ig_result = checked
+                    break
 
     if not ig_result:
         return {**base, "status": "not_found"}
