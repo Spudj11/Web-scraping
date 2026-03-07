@@ -11,7 +11,7 @@ echo ""
 
 # Step 1: Install dependencies (silently, only if needed)
 echo "▶ Installing / checking dependencies..."
-pip install -r requirements.txt -q
+python3 -m pip install -r requirements.txt -q 2>/dev/null || python -m pip install -r requirements.txt -q
 echo "  Done."
 echo ""
 
@@ -19,4 +19,4 @@ echo ""
 echo "▶ Opening the app in your browser..."
 echo "  (Press CTRL+C at any time to stop)"
 echo ""
-streamlit run app.py --server.headless false
+python3 -m streamlit run app.py --server.headless false 2>/dev/null || python -m streamlit run app.py --server.headless false
