@@ -1,16 +1,15 @@
 """
 Instagram Brand Scraper — bulk edition
-Reads brand names from a file and finds each brand's Instagram URL + follower
-count by parsing DuckDuckGo search result snippets (no Instagram login needed).
-
-Each result includes a confidence score (HIGH / MEDIUM / LOW) so you can
-quickly spot which links need manual verification.
+Reads brand names from a file and finds each brand's Instagram URL, follower
+count, D2C website, ecommerce platform (Shopify / WooCommerce / etc.), and
+cross-checks the Instagram handle found on the brand's own website.
 
 Usage:
     python instagram_scraper.py brands.txt
-    python instagram_scraper.py brands.txt --region india        # bias search to India
+    python instagram_scraper.py brands.txt --region india    # bias search to India
+    python instagram_scraper.py brands.txt --no-website      # skip website analysis (faster)
     python instagram_scraper.py brands.txt --output results.csv --workers 8
-    python instagram_scraper.py brands.csv --col 2              # brand name in column 2
+    python instagram_scraper.py brands.csv --col 2           # brand name in column 2
 
 Resume:  if the output CSV already exists the script automatically skips brands
          that were already scraped — safe to re-run after a crash.
@@ -19,7 +18,20 @@ Input file formats:
     • Plain text  — one brand name per line
     • CSV/TSV     — specify which column holds the brand name with --col (1-based)
 
-Confidence column guide:
+Output columns:
+    brand                     Brand name from your input file
+    instagram_url             Instagram profile URL found via search
+    followers                 Follower count from search snippet (if available)
+    confidence                HIGH / MEDIUM / LOW — how well the handle matches the brand
+    confidence_reason         Explanation of the confidence score
+    website_url               Brand's D2C / ecommerce website
+    platform                  Shopify / WooCommerce / Unknown
+    shopify_store             myshopify.com subdomain (e.g. brandname.myshopify.com)
+    instagram_on_website      Instagram handle linked on the brand's own website
+    website_confirms_instagram  yes / no / not_checked
+    status                    ok / url_only / not_found
+
+Confidence guide:
     HIGH    Handle closely matches the brand name             → almost certainly correct
     MEDIUM  Partial match or brand name found in snippet     → probably correct, spot-check
     LOW     No clear link between handle and brand name      → manual verification needed
@@ -35,7 +47,7 @@ import argparse
 import threading
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
@@ -60,16 +72,30 @@ FOLLOWERS_PATTERN = re.compile(
 )
 EXCLUDED_HANDLES = {"explore", "p", "reel", "reels", "stories", "tv", "accounts", "about"}
 
-# Words that are common Instagram handle suffixes — strip before comparing
+# Noise words stripped before comparing brand name vs. handle
 _NOISE_WORDS = {
     "india", "official", "store", "shop", "brand", "beauty", "skincare",
     "care", "co", "the", "by", "get", "wear", "fashion", "style",
     "hq", "in", "uk", "us", "global", "world", "original", "real",
 }
 
+# Domains that are not a brand's own D2C website
+_MARKETPLACE_KEYWORDS = {
+    "amazon", "flipkart", "nykaa", "myntra", "meesho", "ajio", "snapdeal",
+    "paytmmall", "tatacliq", "jiomart", "instagram", "facebook", "twitter",
+    "x.com", "youtube", "linkedin", "indiamart", "justdial", "zomato",
+    "swiggy", "bigbasket", "firstcry", "purplle", "healthkart", "1mg",
+    "pharmeasy", "wikipedia", "reddit", "quora", "glassdoor", "crunchbase",
+    "tracxn", "yourstory", "entrackr", "ambitionbox", "trustpilot",
+}
+
 OUTPUT_FIELDS = [
-    "brand", "instagram_url", "followers",
-    "confidence", "confidence_reason", "status",
+    "brand",
+    "instagram_url", "followers",
+    "confidence", "confidence_reason",
+    "website_url", "platform", "shopify_store",
+    "instagram_on_website", "website_confirms_instagram",
+    "status",
 ]
 
 # ---------------------------------------------------------------------------
@@ -77,14 +103,11 @@ OUTPUT_FIELDS = [
 # ---------------------------------------------------------------------------
 
 def _normalize(text: str) -> str:
-    """Lowercase, keep only alphanumeric, strip noise words."""
-    text = re.sub(r"[^a-z0-9]", "", text.lower())
-    return text
+    return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
 def _normalize_remove_noise(text: str) -> str:
-    """Normalize and also strip common suffix noise words."""
-    text = re.sub(r"[^a-z0-9 ]", " ", text.lower())   # spaces so we can split
+    text = re.sub(r"[^a-z0-9 ]", " ", text.lower())
     words = [w for w in text.split() if w not in _NOISE_WORDS]
     return "".join(words)
 
@@ -94,37 +117,30 @@ def confidence_check(brand_name: str, instagram_url: str, snippet: str) -> tuple
     Return (level, reason) where level is 'HIGH', 'MEDIUM', or 'LOW'.
 
     Scoring (0–100):
-      50 pts  — normalized handle contains normalized brand name (or vice versa)
-      35 pts  — handle contains brand after stripping noise words
-      20 pts  — brand name literally appears in the snippet text
+      50 pts  — handle contains brand name (normalized)
+      35 pts  — match after stripping noise words (india / official / store …)
+      20 pts  — brand name appears in the search snippet bio text
       10 pts  — handle contains the brand's first significant word
-       5 pts  — handle has 'official', 'india', 'store' etc. (legitimacy signal)
+       5 pts  — handle has an official/india/store legitimacy suffix
     """
     handle = instagram_url.rstrip("/").split("/")[-1]
-
     brand_norm        = _normalize(brand_name)
     brand_norm_clean  = _normalize_remove_noise(brand_name)
     handle_norm       = _normalize(handle)
     handle_norm_clean = _normalize_remove_noise(handle)
 
-    score = 0
+    score   = 0
     reasons = []
 
-    # --- Check 1: direct containment (strongest signal) ---
     if brand_norm and (brand_norm in handle_norm or handle_norm in brand_norm):
         score += 50
         reasons.append("handle matches brand name")
-
-    # --- Check 2: match after removing noise words ---
     elif brand_norm_clean and (
         brand_norm_clean in handle_norm_clean
-        or handle_norm_clean in brand_norm_clean
-        and len(brand_norm_clean) >= 3
+        or (handle_norm_clean in brand_norm_clean and len(brand_norm_clean) >= 3)
     ):
         score += 35
         reasons.append("handle matches brand (after removing common words)")
-
-    # --- Check 3: first significant word of brand is in handle ---
     else:
         brand_words = [
             w for w in re.sub(r"[^a-z0-9 ]", " ", brand_name.lower()).split()
@@ -134,19 +150,16 @@ def confidence_check(brand_name: str, instagram_url: str, snippet: str) -> tuple
             score += 10
             reasons.append(f"handle contains '{brand_words[0]}'")
 
-    # --- Check 4: brand name appears in the snippet bio text ---
     if brand_name.lower() in snippet.lower():
         score += 20
         reasons.append("brand name in snippet")
 
-    # --- Check 5: handle carries legitimacy signals ---
     legitimacy = [w for w in _NOISE_WORDS if w in handle_norm and w in
                   {"official", "india", "store", "shop", "hq", "original", "real"}]
     if legitimacy:
         score += 5
         reasons.append(f"handle has '{legitimacy[0]}'")
 
-    # --- Map score to level ---
     if score >= 50:
         level = "HIGH"
     elif score >= 20:
@@ -154,8 +167,7 @@ def confidence_check(brand_name: str, instagram_url: str, snippet: str) -> tuple
     else:
         level = "LOW"
 
-    reason_str = "; ".join(reasons) if reasons else "no match found"
-    return level, reason_str
+    return level, "; ".join(reasons) if reasons else "no match found"
 
 
 # ---------------------------------------------------------------------------
@@ -164,13 +176,13 @@ def confidence_check(brand_name: str, instagram_url: str, snippet: str) -> tuple
 
 class RateLimiter:
     def __init__(self, min_gap_seconds: float):
-        self._gap = min_gap_seconds
+        self._gap  = min_gap_seconds
         self._lock = threading.Lock()
         self._last = 0.0
 
     def wait(self):
         with self._lock:
-            now = time.monotonic()
+            now      = time.monotonic()
             wait_for = self._last + self._gap - now
             if wait_for > 0:
                 time.sleep(wait_for)
@@ -179,7 +191,7 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# Search helpers
+# Instagram search helpers
 # ---------------------------------------------------------------------------
 
 def _is_valid_handle(handle: str) -> bool:
@@ -191,8 +203,7 @@ def _parse_ddg_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
         link_tag = result.select_one("a.result__a, a.result__url")
         if not link_tag:
             continue
-
-        href = link_tag.get("href", "")
+        href      = link_tag.get("href", "")
         url_match = INSTAGRAM_URL_PATTERN.search(href)
         if not url_match or not _is_valid_handle(url_match.group(1)):
             text_url = INSTAGRAM_URL_PATTERN.search(link_tag.get_text())
@@ -201,15 +212,15 @@ def _parse_ddg_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
             url_match = text_url
 
         instagram_url = f"https://www.instagram.com/{url_match.group(1)}/"
-        snippet_tag = result.select_one(
+        snippet_tag   = result.select_one(
             "a.result__snippet, div.result__snippet, span.result__snippet"
         )
-        snippet = snippet_tag.get_text(" ", strip=True) if snippet_tag else ""
+        snippet         = snippet_tag.get_text(" ", strip=True) if snippet_tag else ""
         followers_match = FOLLOWERS_PATTERN.search(snippet)
         return {
             "instagram_url": instagram_url,
-            "followers": followers_match.group(1) if followers_match else None,
-            "snippet": snippet,
+            "followers":     followers_match.group(1) if followers_match else None,
+            "snippet":       snippet,
         }
 
     for m in INSTAGRAM_URL_PATTERN.finditer(raw_html):
@@ -217,8 +228,8 @@ def _parse_ddg_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
             fm = FOLLOWERS_PATTERN.search(raw_html)
             return {
                 "instagram_url": f"https://www.instagram.com/{m.group(1)}/",
-                "followers": fm.group(1) if fm else None,
-                "snippet": "",
+                "followers":     fm.group(1) if fm else None,
+                "snippet":       "",
             }
     return None
 
@@ -259,11 +270,11 @@ def _search_google(query: str, rate_limiter: RateLimiter) -> dict | None:
         if not url_match or not _is_valid_handle(url_match.group(1)):
             continue
         snippet = result.get_text(" ", strip=True)
-        fm = FOLLOWERS_PATTERN.search(snippet)
+        fm      = FOLLOWERS_PATTERN.search(snippet)
         return {
             "instagram_url": f"https://www.instagram.com/{url_match.group(1)}/",
-            "followers": fm.group(1) if fm else None,
-            "snippet": snippet,
+            "followers":     fm.group(1) if fm else None,
+            "snippet":       snippet,
         }
 
     for m in INSTAGRAM_URL_PATTERN.finditer(resp.text):
@@ -271,68 +282,227 @@ def _search_google(query: str, rate_limiter: RateLimiter) -> dict | None:
             fm = FOLLOWERS_PATTERN.search(resp.text)
             return {
                 "instagram_url": f"https://www.instagram.com/{m.group(1)}/",
-                "followers": fm.group(1) if fm else None,
-                "snippet": "",
+                "followers":     fm.group(1) if fm else None,
+                "snippet":       "",
             }
     return None
 
 
 # ---------------------------------------------------------------------------
-# Per-brand scrape with retry
+# Website discovery helpers
 # ---------------------------------------------------------------------------
 
-MAX_RETRIES  = 3
+def _is_marketplace_url(url: str) -> bool:
+    """Return True if the URL belongs to a marketplace / social / non-D2C domain."""
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    return any(kw in host for kw in _MARKETPLACE_KEYWORDS)
+
+
+def _find_website_ddg(query: str, rate_limiter: RateLimiter) -> str | None:
+    """Search DDG and return first non-marketplace URL."""
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    rate_limiter.wait()
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for result in soup.select("div.result, div.results_links"):
+        link_tag = result.select_one("a.result__a, a.result__url")
+        if not link_tag:
+            continue
+        href = link_tag.get("href", "")
+        if href.startswith("http") and not _is_marketplace_url(href):
+            return href
+        # DDG sometimes wraps links — check the text too
+        text = link_tag.get_text()
+        if text.startswith("http") and not _is_marketplace_url(text):
+            return text
+    return None
+
+
+def find_brand_website(brand_name: str, region: str, rate_limiter: RateLimiter) -> str | None:
+    """Return the brand's D2C / ecommerce website URL, or None if not found."""
+    suffix = f" {region}" if region else ""
+    query  = f"{brand_name}{suffix} official website"
+    return _find_website_ddg(query, rate_limiter)
+
+
+# ---------------------------------------------------------------------------
+# Website analysis — platform detection + Instagram handle extraction
+# ---------------------------------------------------------------------------
+
+_SHOPIFY_STORE_RE = re.compile(
+    r'(?:"shop"\s*:\s*"|myshopify\.com/|Shopify\.shop\s*=\s*")([\w-]+)\.myshopify\.com',
+    re.IGNORECASE,
+)
+
+
+def _detect_platform(html: str, final_url: str) -> tuple[str, str | None]:
+    """
+    Return (platform_name, shopify_store_domain).
+    platform_name: 'Shopify' | 'WooCommerce' | 'Unknown'
+    shopify_store_domain: e.g. 'brandname.myshopify.com' or None
+    """
+    # 1. URL itself redirected to myshopify.com
+    if "myshopify.com" in final_url:
+        m = re.search(r"([\w-]+\.myshopify\.com)", final_url)
+        return "Shopify", m.group(1) if m else None
+
+    # 2. Shopify signals in HTML
+    if (
+        "cdn.shopify.com" in html
+        or 'content="Shopify"' in html
+        or "Shopify.theme" in html
+        or "shopify-section" in html
+        or "window.Shopify" in html
+    ):
+        m = _SHOPIFY_STORE_RE.search(html)
+        store = f"{m.group(1)}.myshopify.com" if m else None
+        return "Shopify", store
+
+    # 3. WooCommerce
+    html_lower = html.lower()
+    if "woocommerce" in html_lower or "wp-content/plugins/woo" in html_lower:
+        return "WooCommerce", None
+
+    return "Unknown", None
+
+
+def _extract_instagram_handles_from_html(html: str) -> list[str]:
+    """Return all unique Instagram handles linked in the page HTML."""
+    handles = []
+    seen    = set()
+    for m in INSTAGRAM_URL_PATTERN.finditer(html):
+        handle = m.group(1).lower()
+        if handle not in EXCLUDED_HANDLES and handle not in seen:
+            seen.add(handle)
+            handles.append(handle)
+    return handles
+
+
+def analyze_website(url: str) -> dict:
+    """
+    Fetch the website and return:
+      platform, shopify_store, instagram_handles (list)
+    """
+    empty = {"platform": None, "shopify_store": None, "instagram_handles": []}
+    try:
+        resp = requests.get(
+            url, headers=HEADERS, timeout=10,
+            allow_redirects=True, verify=True,
+        )
+        resp.raise_for_status()
+    except requests.RequestException:
+        return empty
+
+    html      = resp.text
+    final_url = resp.url
+    platform, shopify_store = _detect_platform(html, final_url)
+    handles                  = _extract_instagram_handles_from_html(html)
+    return {
+        "platform":          platform,
+        "shopify_store":     shopify_store,
+        "instagram_handles": handles,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-brand scrape
+# ---------------------------------------------------------------------------
+
+MAX_RETRIES   = 3
 RETRY_BACKOFF = [5, 15, 45]
 
 
 def scrape_brand(
-    brand_name: str,
-    ddg_rl: RateLimiter,
-    goog_rl: RateLimiter,
-    region: str,
+    brand_name:  str,
+    ddg_rl:      RateLimiter,
+    goog_rl:     RateLimiter,
+    region:      str,
+    skip_website: bool,
 ) -> dict:
     base = {
-        "brand": brand_name,
-        "instagram_url": None,
-        "followers": None,
-        "confidence": None,
-        "confidence_reason": None,
+        "brand":                    brand_name,
+        "instagram_url":            None,
+        "followers":                None,
+        "confidence":               None,
+        "confidence_reason":        None,
+        "website_url":              None,
+        "platform":                 None,
+        "shopify_store":            None,
+        "instagram_on_website":     None,
+        "website_confirms_instagram": None,
     }
 
-    # Build search query — include region if provided
-    if region:
-        query = f"{brand_name} {region} site:instagram.com"
-    else:
-        query = f"{brand_name} site:instagram.com"
+    # --- Step 1: find Instagram profile ---
+    ig_query = f"{brand_name} {region} site:instagram.com" if region else \
+               f"{brand_name} site:instagram.com"
 
+    ig_result = None
     for attempt in range(MAX_RETRIES):
-        result = _search_duckduckgo(query, ddg_rl)
-
+        result = _search_duckduckgo(ig_query, ddg_rl)
         if result and result.get("_blocked"):
             time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
             continue
-
         if not result:
-            result = _search_google(query, goog_rl)
-
+            result = _search_google(ig_query, goog_rl)
         if result and result.get("_blocked"):
             time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
             continue
-
         if result:
-            conf_level, conf_reason = confidence_check(
-                brand_name, result["instagram_url"], result.get("snippet", "")
-            )
-            return {
-                **base,
-                "instagram_url": result["instagram_url"],
-                "followers": result["followers"],
-                "confidence": conf_level,
-                "confidence_reason": conf_reason,
-                "status": "ok" if result["followers"] else "url_only",
-            }
+            ig_result = result
+            break
 
-    return {**base, "status": "not_found"}
+    if not ig_result:
+        return {**base, "status": "not_found"}
+
+    conf_level, conf_reason = confidence_check(
+        brand_name, ig_result["instagram_url"], ig_result.get("snippet", "")
+    )
+    row = {
+        **base,
+        "instagram_url":     ig_result["instagram_url"],
+        "followers":         ig_result["followers"],
+        "confidence":        conf_level,
+        "confidence_reason": conf_reason,
+        "status":            "ok" if ig_result["followers"] else "url_only",
+    }
+
+    if skip_website:
+        return row
+
+    # --- Step 2: find D2C website ---
+    website_url = find_brand_website(brand_name, region, ddg_rl)
+    if not website_url:
+        return row
+
+    row["website_url"] = website_url
+
+    # --- Step 3: analyse the website ---
+    site_info = analyze_website(website_url)
+    row["platform"]      = site_info["platform"]
+    row["shopify_store"] = site_info["shopify_store"]
+
+    handles = site_info["instagram_handles"]
+    if handles:
+        row["instagram_on_website"] = handles[0]   # most prominent handle on the page
+
+        # Does the handle on the website match what we found via search?
+        found_handle   = ig_result["instagram_url"].rstrip("/").split("/")[-1].lower()
+        website_handle = handles[0].lower()
+        if found_handle == website_handle:
+            row["website_confirms_instagram"] = "yes"
+        else:
+            row["website_confirms_instagram"] = f"no (website says @{website_handle})"
+    else:
+        row["website_confirms_instagram"] = "not_checked"
+
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -341,11 +511,11 @@ def scrape_brand(
 
 def read_brands(filepath: str, col: int) -> list[str]:
     brands = []
-    ext = os.path.splitext(filepath)[1].lower()
+    ext    = os.path.splitext(filepath)[1].lower()
     with open(filepath, newline="", encoding="utf-8-sig") as fh:
         if ext in (".csv", ".tsv"):
             delimiter = "\t" if ext == ".tsv" else ","
-            reader = csv.reader(fh, delimiter=delimiter)
+            reader    = csv.reader(fh, delimiter=delimiter)
             for row in reader:
                 if not row:
                     continue
@@ -377,7 +547,7 @@ def load_already_done(output_path: str) -> set[str]:
 
 def open_output_csv(output_path: str) -> tuple:
     is_new = not os.path.exists(output_path)
-    fh = open(output_path, "a", newline="", encoding="utf-8")
+    fh     = open(output_path, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(fh, fieldnames=OUTPUT_FIELDS)
     if is_new:
         writer.writeheader()
@@ -390,33 +560,40 @@ def open_output_csv(output_path: str) -> tuple:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bulk Instagram brand scraper with confidence scoring.",
+        description="Bulk Instagram + website scraper for brands.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
             "  python instagram_scraper.py brands.txt\n"
             "  python instagram_scraper.py brands.txt --region india\n"
+            "  python instagram_scraper.py brands.txt --no-website\n"
             "  python instagram_scraper.py brands.csv --col 2 --output results.csv\n"
             "  python instagram_scraper.py brands.txt --workers 8 --delay 0.8\n"
             "\nnote: re-running the same command resumes from where it left off.\n"
             "\nconfidence guide:\n"
             "  HIGH   → handle closely matches brand name (almost certainly correct)\n"
             "  MEDIUM → partial match or brand name in bio (probably correct)\n"
-            "  LOW    → no clear match (manual verification recommended)"
+            "  LOW    → no clear match (manual verification recommended)\n"
+            "\nwebsite_confirms_instagram:\n"
+            "  yes          → website links to the same Instagram we found\n"
+            "  no (@handle) → website links to a DIFFERENT Instagram handle\n"
+            "  not_checked  → website was found but no Instagram link on it"
         ),
     )
     parser.add_argument("input",
                         help="Input file (.txt, .csv, .tsv) with brand names")
-    parser.add_argument("--output", default="instagram_results.csv",
-                        help="Output CSV file (default: instagram_results.csv)")
-    parser.add_argument("--col", type=int, default=1,
+    parser.add_argument("--output",     default="instagram_results.csv",
+                        help="Output CSV (default: instagram_results.csv)")
+    parser.add_argument("--col",        type=int, default=1,
                         help="Column number (1-based) for brand name in CSV (default: 1)")
-    parser.add_argument("--workers", type=int, default=5,
-                        help="Parallel worker threads (default: 5; max recommended: 10)")
-    parser.add_argument("--delay", type=float, default=1.0,
-                        help="Min seconds between requests per search engine (default: 1.0)")
-    parser.add_argument("--region", default="",
-                        help="Region keyword appended to every search, e.g. 'india'")
+    parser.add_argument("--workers",    type=int, default=5,
+                        help="Parallel worker threads (default: 5; max: 10)")
+    parser.add_argument("--delay",      type=float, default=1.0,
+                        help="Min seconds between search-engine requests (default: 1.0)")
+    parser.add_argument("--region",     default="",
+                        help="Region keyword appended to searches, e.g. 'india'")
+    parser.add_argument("--no-website", action="store_true",
+                        help="Skip website discovery and analysis (faster)")
     args = parser.parse_args()
 
     if args.workers > 10:
@@ -425,6 +602,8 @@ def main():
     print(f"Reading brands from : {args.input}")
     if args.region:
         print(f"Region filter       : {args.region}")
+    if args.no_website:
+        print("Website analysis    : disabled (--no-website)")
 
     all_brands = read_brands(args.input, args.col)
     if not all_brands:
@@ -432,7 +611,7 @@ def main():
         sys.exit(1)
     print(f"Total brands        : {len(all_brands):,}")
 
-    done = load_already_done(args.output)
+    done         = load_already_done(args.output)
     brands_to_do = [b for b in all_brands if b not in done]
     print(f"Already done        : {len(done):,}")
     print(f"Remaining           : {len(brands_to_do):,}")
@@ -445,33 +624,34 @@ def main():
     goog_rate = RateLimiter(args.delay)
 
     out_fh, writer = open_output_csv(args.output)
-    write_lock = threading.Lock()
+    write_lock     = threading.Lock()
 
     total     = len(brands_to_do)
     completed = 0
     errors    = 0
     start     = time.monotonic()
-
-    # Confidence counters for final summary
-    conf_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, None: 0}
+    conf_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
 
     print(f"\nStarting scrape with {args.workers} workers...\n")
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(scrape_brand, brand, ddg_rate, goog_rate, args.region): brand
+            pool.submit(
+                scrape_brand, brand, ddg_rate, goog_rate, args.region, args.no_website
+            ): brand
             for brand in brands_to_do
         }
 
         for future in as_completed(futures):
-            result = future.result()
+            result    = future.result()
             completed += 1
 
             if result["status"] == "not_found":
                 errors += 1
-            conf_counts[result.get("confidence")] = (
-                conf_counts.get(result.get("confidence"), 0) + 1
-            )
+            if result.get("confidence"):
+                conf_counts[result["confidence"]] = (
+                    conf_counts.get(result["confidence"], 0) + 1
+                )
 
             with write_lock:
                 writer.writerow(result)
@@ -483,16 +663,22 @@ def main():
             eta_str  = time.strftime("%H:%M:%S", time.gmtime(eta_secs))
             pct      = completed / total * 100
 
-            conf = result.get("confidence") or "-"
+            conf     = result.get("confidence") or "-"
             conf_tag = {"HIGH": "[H]", "MEDIUM": "[M]", "LOW": "[L]"}.get(conf, "[ ]")
-            status_icon = "✓" if result["status"] == "ok" else (
-                          "~" if result["status"] == "url_only" else "✗")
+            s_icon   = "✓" if result["status"] == "ok" else (
+                       "~" if result["status"] == "url_only" else "✗")
+
+            platform = result.get("platform") or ""
+            shopify  = f" ({result['shopify_store']})" if result.get("shopify_store") else ""
+            site     = f"  🌐 {result['website_url'][:40]} {platform}{shopify}" \
+                       if result.get("website_url") else ""
 
             print(
                 f"[{pct:5.1f}%] {completed:>{len(str(total))}}/{total}  "
-                f"ETA {eta_str}  {status_icon}{conf_tag} {result['brand'][:35]}"
+                f"ETA {eta_str}  {s_icon}{conf_tag} {result['brand'][:30]}"
                 f"  →  {result['instagram_url'] or 'not found'}"
-                f"  {result['followers'] or ''}",
+                f"  {result['followers'] or ''}"
+                f"{site}",
                 flush=True,
             )
 
@@ -500,14 +686,15 @@ def main():
 
     elapsed = time.monotonic() - start
     found   = completed - errors
-    print(f"\n{'─'*65}")
+    print(f"\n{'─'*70}")
     print(f"Done in {elapsed/60:.1f} min  |  Output: {args.output}")
     print(f"  Found        : {found:,} / {total:,}")
     print(f"  Not found    : {errors:,}")
     print(f"  Confidence   →  HIGH: {conf_counts.get('HIGH',0):,}  "
           f"MEDIUM: {conf_counts.get('MEDIUM',0):,}  "
           f"LOW: {conf_counts.get('LOW',0):,}")
-    print(f"\nTip: open {args.output} in Excel and filter 'confidence' = LOW to review manually.")
+    print(f"\nTip: in Excel, filter 'confidence' = LOW or "
+          f"'website_confirms_instagram' starts with 'no' to find mismatches.")
 
 
 if __name__ == "__main__":
