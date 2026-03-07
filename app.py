@@ -18,7 +18,7 @@ from instagram_scraper import (
     scrape_brand,
     OUTPUT_FIELDS,
 )
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 st.set_page_config(page_title="Instagram Brand Scraper", page_icon="📸", layout="wide")
 
@@ -94,29 +94,41 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
 
         start_time = time.time()
         done = 0
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-            done += 1
+        pending = set(futures.keys())
+        while pending:
+            done_set, pending = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
 
             elapsed = int(time.time() - start_time)
             elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
 
-            pct   = done / total
-            brand = result["brand"]
-            ig    = result.get("instagram_url") or "not found"
-            conf  = result.get("confidence") or "-"
-            status_icon = "✓" if result["status"] == "ok" else (
-                          "~" if result["status"] == "url_only" else "✗")
+            if not done_set:
+                # No brand finished in this 5-second window — just tick the progress bar
+                progress.progress(
+                    done / total,
+                    text=f"⏳ {done}/{total} complete — {len(pending)} in progress — {elapsed_str} elapsed",
+                )
+                continue
 
-            log_lines.append(
-                f"{status_icon} [{conf}]  **{brand}**  →  {ig}"
-            )
-            if len(log_lines) > 50:          # keep last 50 lines visible
-                log_lines = log_lines[-50:]
+            for future in done_set:
+                result = future.result()
+                results.append(result)
+                done += 1
 
-            progress.progress(pct, text=f"Scraped {done}/{total} — {brand} (elapsed: {elapsed_str})")
-            log_area.markdown("\n\n".join(log_lines))
+                pct   = done / total
+                brand = result["brand"]
+                ig    = result.get("instagram_url") or "not found"
+                conf  = result.get("confidence") or "-"
+                status_icon = "✓" if result["status"] == "ok" else (
+                              "~" if result["status"] == "url_only" else "✗")
+
+                log_lines.append(
+                    f"{status_icon} [{conf}]  **{brand}**  →  {ig}"
+                )
+                if len(log_lines) > 50:
+                    log_lines = log_lines[-50:]
+
+                progress.progress(pct, text=f"Scraped {done}/{total} — {brand} (elapsed: {elapsed_str})")
+                log_area.markdown("\n\n".join(log_lines))
 
     progress.progress(1.0, text="Done!")
     st.success(f"Finished! Scraped {total} brands.")
