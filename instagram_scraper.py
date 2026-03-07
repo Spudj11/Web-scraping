@@ -47,7 +47,7 @@ import argparse
 import threading
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
@@ -298,6 +298,23 @@ def _is_marketplace_url(url: str) -> bool:
     return any(kw in host for kw in _MARKETPLACE_KEYWORDS)
 
 
+def _decode_ddg_href(href: str) -> str | None:
+    """
+    DDG wraps all result links as /l/?uddg=ENCODED_URL&rut=...
+    Extract and decode the real destination URL.
+    Falls through for direct http(s) links.
+    """
+    if not href:
+        return None
+    if "uddg=" in href:
+        m = re.search(r"uddg=([^&]+)", href)
+        if m:
+            return unquote(m.group(1))
+    if href.startswith("http"):
+        return href
+    return None
+
+
 def _find_website_ddg(query: str, rate_limiter: RateLimiter) -> str | None:
     """Search DDG and return first non-marketplace URL."""
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
@@ -312,16 +329,22 @@ def _find_website_ddg(query: str, rate_limiter: RateLimiter) -> str | None:
 
     soup = BeautifulSoup(resp.text, "html.parser")
     for result in soup.select("div.result, div.results_links"):
-        link_tag = result.select_one("a.result__a, a.result__url")
+        link_tag = result.select_one("a.result__a")
         if not link_tag:
             continue
-        href = link_tag.get("href", "")
-        if href.startswith("http") and not _is_marketplace_url(href):
-            return href
-        # DDG sometimes wraps links — check the text too
-        text = link_tag.get_text()
-        if text.startswith("http") and not _is_marketplace_url(text):
-            return text
+        real_url = _decode_ddg_href(link_tag.get("href", ""))
+        if real_url and not _is_marketplace_url(real_url):
+            return real_url
+
+        # Fallback: display URL text (e.g. "mamaearth.in › shop")
+        url_span = result.select_one("span.result__url, div.result__url")
+        if url_span:
+            display = url_span.get_text(strip=True).split("›")[0].strip()
+            if display and "." in display and not _is_marketplace_url(display):
+                # Reconstruct full URL from display domain
+                if not display.startswith("http"):
+                    display = "https://" + display
+                return display
     return None
 
 
@@ -373,37 +396,79 @@ def _detect_platform(html: str, final_url: str) -> tuple[str, str | None]:
     return "Unknown", None
 
 
-def _extract_instagram_handles_from_html(html: str) -> list[str]:
-    """Return all unique Instagram handles linked in the page HTML."""
-    handles = []
+def _extract_instagram_handles_from_html(html: str, soup: BeautifulSoup | None = None) -> list[str]:
+    """
+    Return Instagram handles found on the page, ordered by how likely they are
+    to be the brand's own account:
+      1. Links inside <footer> or elements with class containing 'footer'/'social'
+      2. All other <a href> links to instagram.com
+      3. Any raw instagram.com URLs anywhere in the HTML
+    """
     seen    = set()
+    handles = []
+
+    def _add(handle: str):
+        h = handle.lower().strip(".")
+        if h and h not in EXCLUDED_HANDLES and h not in seen:
+            seen.add(h)
+            handles.append(h)
+
+    if soup:
+        # Priority 1: footer / social-icon sections (most likely the brand's own link)
+        for section in soup.select(
+            "footer, [class*='footer'], [class*='social'], [id*='footer'], [id*='social']"
+        ):
+            for a in section.find_all("a", href=True):
+                m = INSTAGRAM_URL_PATTERN.search(a["href"])
+                if m:
+                    _add(m.group(1))
+
+        # Priority 2: remaining <a> tags
+        for a in soup.find_all("a", href=True):
+            m = INSTAGRAM_URL_PATTERN.search(a["href"])
+            if m:
+                _add(m.group(1))
+
+    # Priority 3: raw scan of full HTML (catches JS-rendered or inline text)
     for m in INSTAGRAM_URL_PATTERN.finditer(html):
-        handle = m.group(1).lower()
-        if handle not in EXCLUDED_HANDLES and handle not in seen:
-            seen.add(handle)
-            handles.append(handle)
+        _add(m.group(1))
+
     return handles
 
 
 def analyze_website(url: str) -> dict:
     """
-    Fetch the website and return:
-      platform, shopify_store, instagram_handles (list)
+    Fetch the brand's website and return:
+      platform, shopify_store, instagram_handles (list, priority-ordered)
+    Tries with SSL verification first, falls back without if the cert is broken.
     """
     empty = {"platform": None, "shopify_store": None, "instagram_handles": []}
-    try:
-        resp = requests.get(
+
+    def _fetch(verify_ssl: bool):
+        return requests.get(
             url, headers=HEADERS, timeout=10,
-            allow_redirects=True, verify=True,
+            allow_redirects=True, verify=verify_ssl,
         )
+
+    resp = None
+    try:
+        resp = _fetch(verify_ssl=True)
         resp.raise_for_status()
+    except requests.exceptions.SSLError:
+        try:
+            resp = _fetch(verify_ssl=False)
+            resp.raise_for_status()
+        except requests.RequestException:
+            return empty
     except requests.RequestException:
         return empty
 
     html      = resp.text
     final_url = resp.url
+    soup      = BeautifulSoup(html, "html.parser")
+
     platform, shopify_store = _detect_platform(html, final_url)
-    handles                  = _extract_instagram_handles_from_html(html)
+    handles                  = _extract_instagram_handles_from_html(html, soup)
     return {
         "platform":          platform,
         "shopify_store":     shopify_store,
@@ -490,15 +555,23 @@ def scrape_brand(
 
     handles = site_info["instagram_handles"]
     if handles:
-        row["instagram_on_website"] = handles[0]   # most prominent handle on the page
+        row["instagram_on_website"] = handles[0]   # highest-priority handle on the page
 
-        # Does the handle on the website match what we found via search?
         found_handle   = ig_result["instagram_url"].rstrip("/").split("/")[-1].lower()
         website_handle = handles[0].lower()
+
         if found_handle == website_handle:
+            # Website confirms the Instagram we found — upgrade confidence to HIGH
             row["website_confirms_instagram"] = "yes"
+            row["confidence"]        = "HIGH"
+            row["confidence_reason"] = (conf_reason + "; confirmed by brand website").lstrip("; ")
         else:
+            # Website links to a DIFFERENT Instagram — this is the strongest
+            # signal that we have the wrong account. Switch to the website's handle.
             row["website_confirms_instagram"] = f"no (website says @{website_handle})"
+            row["instagram_url"]     = f"https://www.instagram.com/{website_handle}/"
+            row["confidence"]        = "HIGH"
+            row["confidence_reason"] = f"overridden by brand website (@{website_handle})"
     else:
         row["website_confirms_instagram"] = "not_checked"
 
