@@ -669,25 +669,40 @@ def read_brands(filepath: str, col: int) -> list[str]:
     return brands
 
 
-def load_already_done(output_path: str) -> set[str]:
-    done = set()
+def load_existing_rows(output_path: str) -> dict[str, dict]:
+    """
+    Load existing CSV rows into a dict keyed by brand name.
+    Preserves all data including manually-added values.
+    """
+    rows = {}
     if not os.path.exists(output_path):
-        return done
+        return rows
     with open(output_path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
             name = row.get("brand", "").strip()
             if name:
-                done.add(name)
-    return done
+                rows[name] = dict(row)
+    return rows
+
+
+def _needs_rescrape(row: dict, skip_website: bool) -> bool:
+    """
+    Return True if an existing row is missing data that could be filled in.
+    Brands with manually-added website_url are considered complete.
+    """
+    if not row.get("instagram_url"):
+        return True
+    if not skip_website and not row.get("website_url"):
+        return True
+    return False
 
 
 def open_output_csv(output_path: str) -> tuple:
-    is_new = not os.path.exists(output_path)
-    fh     = open(output_path, "a", newline="", encoding="utf-8")
+    """Open output CSV in write mode (fresh), writing the header."""
+    fh     = open(output_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(fh, fieldnames=OUTPUT_FIELDS)
-    if is_new:
-        writer.writeheader()
+    writer.writeheader()
     return fh, writer
 
 
@@ -748,20 +763,24 @@ def main():
         sys.exit(1)
     print(f"Total brands        : {len(all_brands):,}")
 
-    done         = load_already_done(args.output)
-    brands_to_do = [b for b in all_brands if b not in done]
-    print(f"Already done        : {len(done):,}")
-    print(f"Remaining           : {len(brands_to_do):,}")
+    # Load all existing rows — preserves manually-added data
+    existing_rows = load_existing_rows(args.output)
 
-    if not brands_to_do:
-        print("All brands already processed. Nothing to do.")
-        sys.exit(0)
+    # Only re-scrape brands that are new or have missing data
+    brands_to_do = [
+        b for b in all_brands
+        if b not in existing_rows or _needs_rescrape(existing_rows[b], args.no_website)
+    ]
+    already_complete = len(all_brands) - len(brands_to_do)
+    print(f"Already complete    : {already_complete:,}")
+    print(f"To scrape / update  : {len(brands_to_do):,}")
 
     ddg_rate  = RateLimiter(args.delay)
     goog_rate = RateLimiter(args.delay)
 
-    out_fh, writer = open_output_csv(args.output)
-    write_lock     = threading.Lock()
+    # In-memory store of final results (start with everything we already have)
+    results_store: dict[str, dict] = dict(existing_rows)
+    store_lock = threading.Lock()
 
     total     = len(brands_to_do)
     completed = 0
@@ -769,62 +788,86 @@ def main():
     start     = time.monotonic()
     conf_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
 
-    print(f"\nStarting scrape with {args.workers} workers...\n")
+    if not brands_to_do:
+        print("All brands already complete. Nothing to scrape.")
+    else:
+        print(f"\nStarting scrape with {args.workers} workers...\n")
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {
-            pool.submit(
-                scrape_brand, brand, ddg_rate, goog_rate, args.region, args.no_website
-            ): brand
-            for brand in brands_to_do
-        }
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(
+                    scrape_brand, brand, ddg_rate, goog_rate, args.region, args.no_website
+                ): brand
+                for brand in brands_to_do
+            }
 
-        for future in as_completed(futures):
-            result    = future.result()
-            completed += 1
+            for future in as_completed(futures):
+                result    = future.result()
+                completed += 1
 
-            if result["status"] == "not_found":
-                errors += 1
-            if result.get("confidence"):
-                conf_counts[result["confidence"]] = (
-                    conf_counts.get(result["confidence"], 0) + 1
+                if result["status"] == "not_found":
+                    errors += 1
+                if result.get("confidence"):
+                    conf_counts[result["confidence"]] = (
+                        conf_counts.get(result["confidence"], 0) + 1
+                    )
+
+                with store_lock:
+                    brand_key = result["brand"]
+                    if brand_key in results_store:
+                        # Merge: new scraped values fill in empty fields;
+                        # existing non-empty values (e.g. manually added) are kept.
+                        merged = dict(results_store[brand_key])
+                        for field, value in result.items():
+                            if value and not merged.get(field):
+                                merged[field] = value
+                        # Always update instagram/confidence/status from fresh scrape
+                        for field in ("instagram_url", "followers", "confidence",
+                                      "confidence_reason", "status"):
+                            if result.get(field):
+                                merged[field] = result[field]
+                        results_store[brand_key] = merged
+                    else:
+                        results_store[brand_key] = result
+
+                elapsed  = time.monotonic() - start
+                rate     = completed / elapsed if elapsed else 0
+                eta_secs = (total - completed) / rate if rate else 0
+                eta_str  = time.strftime("%H:%M:%S", time.gmtime(eta_secs))
+                pct      = completed / total * 100
+
+                conf     = result.get("confidence") or "-"
+                conf_tag = {"HIGH": "[H]", "MEDIUM": "[M]", "LOW": "[L]"}.get(conf, "[ ]")
+                s_icon   = "✓" if result["status"] == "ok" else (
+                           "~" if result["status"] == "url_only" else "✗")
+
+                platform   = result.get("platform") or ""
+                shopify    = f" ({result['shopify_store']})" if result.get("shopify_store") else ""
+                site       = f"  🌐 {result['website_url'][:35]} [{platform}{shopify}]" \
+                             if result.get("website_url") else ""
+                markets    = "  ".join(
+                    f"{field.replace('_url','').upper()}✓"
+                    for field, _ in MARKETPLACE_TARGETS
+                    if result.get(field)
+                )
+                market_str = f"  [{markets}]" if markets else ""
+
+                print(
+                    f"[{pct:5.1f}%] {completed:>{len(str(total))}}/{total}  "
+                    f"ETA {eta_str}  {s_icon}{conf_tag} {result['brand'][:28]}"
+                    f"  →  {result['instagram_url'] or 'not found'}"
+                    f"  {result['followers'] or ''}"
+                    f"{site}{market_str}",
+                    flush=True,
                 )
 
-            with write_lock:
-                writer.writerow(result)
-                out_fh.flush()
-
-            elapsed  = time.monotonic() - start
-            rate     = completed / elapsed if elapsed else 0
-            eta_secs = (total - completed) / rate if rate else 0
-            eta_str  = time.strftime("%H:%M:%S", time.gmtime(eta_secs))
-            pct      = completed / total * 100
-
-            conf     = result.get("confidence") or "-"
-            conf_tag = {"HIGH": "[H]", "MEDIUM": "[M]", "LOW": "[L]"}.get(conf, "[ ]")
-            s_icon   = "✓" if result["status"] == "ok" else (
-                       "~" if result["status"] == "url_only" else "✗")
-
-            platform   = result.get("platform") or ""
-            shopify    = f" ({result['shopify_store']})" if result.get("shopify_store") else ""
-            site       = f"  🌐 {result['website_url'][:35]} [{platform}{shopify}]" \
-                         if result.get("website_url") else ""
-            markets    = "  ".join(
-                f"{field.replace('_url','').upper()}✓"
-                for field, _ in MARKETPLACE_TARGETS
-                if result.get(field)
-            )
-            market_str = f"  [{markets}]" if markets else ""
-
-            print(
-                f"[{pct:5.1f}%] {completed:>{len(str(total))}}/{total}  "
-                f"ETA {eta_str}  {s_icon}{conf_tag} {result['brand'][:28]}"
-                f"  →  {result['instagram_url'] or 'not found'}"
-                f"  {result['followers'] or ''}"
-                f"{site}{market_str}",
-                flush=True,
-            )
-
+    # Write the final merged CSV (all brands, in input order)
+    out_fh, writer = open_output_csv(args.output)
+    for brand in all_brands:
+        row = results_store.get(brand)
+        if row:
+            # Ensure only known fields are written (handle extra cols from manual edits)
+            writer.writerow({f: row.get(f, "") for f in OUTPUT_FIELDS})
     out_fh.close()
 
     elapsed = time.monotonic() - start
