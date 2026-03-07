@@ -3,18 +3,26 @@ Instagram Brand Scraper — bulk edition
 Reads brand names from a file and finds each brand's Instagram URL + follower
 count by parsing DuckDuckGo search result snippets (no Instagram login needed).
 
+Each result includes a confidence score (HIGH / MEDIUM / LOW) so you can
+quickly spot which links need manual verification.
+
 Usage:
     python instagram_scraper.py brands.txt
+    python instagram_scraper.py brands.txt --region india        # bias search to India
     python instagram_scraper.py brands.txt --output results.csv --workers 8
-    python instagram_scraper.py brands.csv --col 2          # brand name is in column 2
-    python instagram_scraper.py brands.txt --workers 5 --delay 1.5
+    python instagram_scraper.py brands.csv --col 2              # brand name in column 2
 
 Resume:  if the output CSV already exists the script automatically skips brands
          that were already scraped — safe to re-run after a crash.
 
-Input file formats supported:
+Input file formats:
     • Plain text  — one brand name per line
     • CSV/TSV     — specify which column holds the brand name with --col (1-based)
+
+Confidence column guide:
+    HIGH    Handle closely matches the brand name             → almost certainly correct
+    MEDIUM  Partial match or brand name found in snippet     → probably correct, spot-check
+    LOW     No clear link between handle and brand name      → manual verification needed
 """
 
 import csv
@@ -52,10 +60,106 @@ FOLLOWERS_PATTERN = re.compile(
 )
 EXCLUDED_HANDLES = {"explore", "p", "reel", "reels", "stories", "tv", "accounts", "about"}
 
-OUTPUT_FIELDS = ["brand", "instagram_url", "followers", "status"]
+# Words that are common Instagram handle suffixes — strip before comparing
+_NOISE_WORDS = {
+    "india", "official", "store", "shop", "brand", "beauty", "skincare",
+    "care", "co", "the", "by", "get", "wear", "fashion", "style",
+    "hq", "in", "uk", "us", "global", "world", "original", "real",
+}
+
+OUTPUT_FIELDS = [
+    "brand", "instagram_url", "followers",
+    "confidence", "confidence_reason", "status",
+]
 
 # ---------------------------------------------------------------------------
-# Rate limiter — enforces a minimum gap between outgoing requests globally
+# Confidence scoring
+# ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
+    """Lowercase, keep only alphanumeric, strip noise words."""
+    text = re.sub(r"[^a-z0-9]", "", text.lower())
+    return text
+
+
+def _normalize_remove_noise(text: str) -> str:
+    """Normalize and also strip common suffix noise words."""
+    text = re.sub(r"[^a-z0-9 ]", " ", text.lower())   # spaces so we can split
+    words = [w for w in text.split() if w not in _NOISE_WORDS]
+    return "".join(words)
+
+
+def confidence_check(brand_name: str, instagram_url: str, snippet: str) -> tuple[str, str]:
+    """
+    Return (level, reason) where level is 'HIGH', 'MEDIUM', or 'LOW'.
+
+    Scoring (0–100):
+      50 pts  — normalized handle contains normalized brand name (or vice versa)
+      35 pts  — handle contains brand after stripping noise words
+      20 pts  — brand name literally appears in the snippet text
+      10 pts  — handle contains the brand's first significant word
+       5 pts  — handle has 'official', 'india', 'store' etc. (legitimacy signal)
+    """
+    handle = instagram_url.rstrip("/").split("/")[-1]
+
+    brand_norm        = _normalize(brand_name)
+    brand_norm_clean  = _normalize_remove_noise(brand_name)
+    handle_norm       = _normalize(handle)
+    handle_norm_clean = _normalize_remove_noise(handle)
+
+    score = 0
+    reasons = []
+
+    # --- Check 1: direct containment (strongest signal) ---
+    if brand_norm and (brand_norm in handle_norm or handle_norm in brand_norm):
+        score += 50
+        reasons.append("handle matches brand name")
+
+    # --- Check 2: match after removing noise words ---
+    elif brand_norm_clean and (
+        brand_norm_clean in handle_norm_clean
+        or handle_norm_clean in brand_norm_clean
+        and len(brand_norm_clean) >= 3
+    ):
+        score += 35
+        reasons.append("handle matches brand (after removing common words)")
+
+    # --- Check 3: first significant word of brand is in handle ---
+    else:
+        brand_words = [
+            w for w in re.sub(r"[^a-z0-9 ]", " ", brand_name.lower()).split()
+            if w not in _NOISE_WORDS and len(w) >= 3
+        ]
+        if brand_words and brand_words[0] in handle_norm:
+            score += 10
+            reasons.append(f"handle contains '{brand_words[0]}'")
+
+    # --- Check 4: brand name appears in the snippet bio text ---
+    if brand_name.lower() in snippet.lower():
+        score += 20
+        reasons.append("brand name in snippet")
+
+    # --- Check 5: handle carries legitimacy signals ---
+    legitimacy = [w for w in _NOISE_WORDS if w in handle_norm and w in
+                  {"official", "india", "store", "shop", "hq", "original", "real"}]
+    if legitimacy:
+        score += 5
+        reasons.append(f"handle has '{legitimacy[0]}'")
+
+    # --- Map score to level ---
+    if score >= 50:
+        level = "HIGH"
+    elif score >= 20:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    reason_str = "; ".join(reasons) if reasons else "no match found"
+    return level, reason_str
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
@@ -70,7 +174,6 @@ class RateLimiter:
             wait_for = self._last + self._gap - now
             if wait_for > 0:
                 time.sleep(wait_for)
-            # Add small random jitter to avoid thundering-herd
             time.sleep(random.uniform(0.05, 0.2))
             self._last = time.monotonic()
 
@@ -83,11 +186,7 @@ def _is_valid_handle(handle: str) -> bool:
     return handle.lower() not in EXCLUDED_HANDLES
 
 
-def _parse_result_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
-    """
-    Walk DuckDuckGo result <div class="result"> blocks.
-    Each block has an anchor with the Instagram URL and a snippet with follower count.
-    """
+def _parse_ddg_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
     for result in soup.select("div.result, div.results_links"):
         link_tag = result.select_one("a.result__a, a.result__url")
         if not link_tag:
@@ -110,22 +209,22 @@ def _parse_result_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
         return {
             "instagram_url": instagram_url,
             "followers": followers_match.group(1) if followers_match else None,
+            "snippet": snippet,
         }
 
-    # Fallback: raw HTML scan
     for m in INSTAGRAM_URL_PATTERN.finditer(raw_html):
         if _is_valid_handle(m.group(1)):
             fm = FOLLOWERS_PATTERN.search(raw_html)
             return {
                 "instagram_url": f"https://www.instagram.com/{m.group(1)}/",
                 "followers": fm.group(1) if fm else None,
+                "snippet": "",
             }
     return None
 
 
-def _search_duckduckgo(brand_name: str, rate_limiter: RateLimiter) -> dict | None:
-    query = quote_plus(f"{brand_name} site:instagram.com")
-    url = f"https://duckduckgo.com/html/?q={query}"
+def _search_duckduckgo(query: str, rate_limiter: RateLimiter) -> dict | None:
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     rate_limiter.wait()
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -134,13 +233,11 @@ def _search_duckduckgo(brand_name: str, rate_limiter: RateLimiter) -> dict | Non
         resp.raise_for_status()
     except requests.RequestException:
         return None
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return _parse_result_blocks(soup, resp.text)
+    return _parse_ddg_blocks(BeautifulSoup(resp.text, "html.parser"), resp.text)
 
 
-def _search_google(brand_name: str, rate_limiter: RateLimiter) -> dict | None:
-    query = quote_plus(f"{brand_name} site:instagram.com")
-    url = f"https://www.google.com/search?q={query}&num=5"
+def _search_google(query: str, rate_limiter: RateLimiter) -> dict | None:
+    url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
     rate_limiter.wait()
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -166,6 +263,7 @@ def _search_google(brand_name: str, rate_limiter: RateLimiter) -> dict | None:
         return {
             "instagram_url": f"https://www.instagram.com/{url_match.group(1)}/",
             "followers": fm.group(1) if fm else None,
+            "snippet": snippet,
         }
 
     for m in INSTAGRAM_URL_PATTERN.finditer(resp.text):
@@ -174,53 +272,66 @@ def _search_google(brand_name: str, rate_limiter: RateLimiter) -> dict | None:
             return {
                 "instagram_url": f"https://www.instagram.com/{m.group(1)}/",
                 "followers": fm.group(1) if fm else None,
+                "snippet": "",
             }
     return None
 
 
 # ---------------------------------------------------------------------------
-# Per-brand scrape with retry logic
+# Per-brand scrape with retry
 # ---------------------------------------------------------------------------
 
-MAX_RETRIES = 3
-RETRY_BACKOFF = [5, 15, 45]   # seconds to wait after each failed attempt
+MAX_RETRIES  = 3
+RETRY_BACKOFF = [5, 15, 45]
 
 
-def scrape_brand(brand_name: str, ddg_rl: RateLimiter, goog_rl: RateLimiter) -> dict:
-    """
-    Try DuckDuckGo first; fall back to Google.
-    Retries up to MAX_RETRIES times if rate-limited or blocked.
-    Returns a dict: brand, instagram_url, followers, status
-    """
-    base = {"brand": brand_name, "instagram_url": None, "followers": None}
+def scrape_brand(
+    brand_name: str,
+    ddg_rl: RateLimiter,
+    goog_rl: RateLimiter,
+    region: str,
+) -> dict:
+    base = {
+        "brand": brand_name,
+        "instagram_url": None,
+        "followers": None,
+        "confidence": None,
+        "confidence_reason": None,
+    }
+
+    # Build search query — include region if provided
+    if region:
+        query = f"{brand_name} {region} site:instagram.com"
+    else:
+        query = f"{brand_name} site:instagram.com"
 
     for attempt in range(MAX_RETRIES):
-        result = _search_duckduckgo(brand_name, ddg_rl)
+        result = _search_duckduckgo(query, ddg_rl)
 
         if result and result.get("_blocked"):
-            # Rate-limited — back off and try again
-            sleep_for = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-            time.sleep(sleep_for)
+            time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
             continue
 
         if not result:
-            # DDG failed, try Google
-            result = _search_google(brand_name, goog_rl)
+            result = _search_google(query, goog_rl)
 
         if result and result.get("_blocked"):
-            sleep_for = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-            time.sleep(sleep_for)
+            time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
             continue
 
         if result:
+            conf_level, conf_reason = confidence_check(
+                brand_name, result["instagram_url"], result.get("snippet", "")
+            )
             return {
                 **base,
                 "instagram_url": result["instagram_url"],
                 "followers": result["followers"],
+                "confidence": conf_level,
+                "confidence_reason": conf_reason,
                 "status": "ok" if result["followers"] else "url_only",
             }
 
-    # All retries exhausted
     return {**base, "status": "not_found"}
 
 
@@ -229,10 +340,8 @@ def scrape_brand(brand_name: str, ddg_rl: RateLimiter, goog_rl: RateLimiter) -> 
 # ---------------------------------------------------------------------------
 
 def read_brands(filepath: str, col: int) -> list[str]:
-    """Read brand names from a plain-text or CSV file."""
     brands = []
     ext = os.path.splitext(filepath)[1].lower()
-
     with open(filepath, newline="", encoding="utf-8-sig") as fh:
         if ext in (".csv", ".tsv"):
             delimiter = "\t" if ext == ".tsv" else ","
@@ -250,12 +359,10 @@ def read_brands(filepath: str, col: int) -> list[str]:
                 name = line.strip()
                 if name and not name.startswith("#"):
                     brands.append(name)
-
     return brands
 
 
 def load_already_done(output_path: str) -> set[str]:
-    """Return set of brand names already present in the output CSV."""
     done = set()
     if not os.path.exists(output_path):
         return done
@@ -269,7 +376,6 @@ def load_already_done(output_path: str) -> set[str]:
 
 
 def open_output_csv(output_path: str) -> tuple:
-    """Open output CSV for appending; write header if new file."""
     is_new = not os.path.exists(output_path)
     fh = open(output_path, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(fh, fieldnames=OUTPUT_FIELDS)
@@ -284,53 +390,60 @@ def open_output_csv(output_path: str) -> tuple:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bulk Instagram brand scraper — reads from file, writes to CSV.",
+        description="Bulk Instagram brand scraper with confidence scoring.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
             "  python instagram_scraper.py brands.txt\n"
+            "  python instagram_scraper.py brands.txt --region india\n"
             "  python instagram_scraper.py brands.csv --col 2 --output results.csv\n"
             "  python instagram_scraper.py brands.txt --workers 8 --delay 0.8\n"
-            "\nnote: re-running the same command resumes from where it left off."
+            "\nnote: re-running the same command resumes from where it left off.\n"
+            "\nconfidence guide:\n"
+            "  HIGH   → handle closely matches brand name (almost certainly correct)\n"
+            "  MEDIUM → partial match or brand name in bio (probably correct)\n"
+            "  LOW    → no clear match (manual verification recommended)"
         ),
     )
-    parser.add_argument("input", help="Input file (.txt, .csv, or .tsv) with brand names")
+    parser.add_argument("input",
+                        help="Input file (.txt, .csv, .tsv) with brand names")
     parser.add_argument("--output", default="instagram_results.csv",
                         help="Output CSV file (default: instagram_results.csv)")
     parser.add_argument("--col", type=int, default=1,
-                        help="Column number (1-based) for brand name in CSV input (default: 1)")
+                        help="Column number (1-based) for brand name in CSV (default: 1)")
     parser.add_argument("--workers", type=int, default=5,
                         help="Parallel worker threads (default: 5; max recommended: 10)")
     parser.add_argument("--delay", type=float, default=1.0,
-                        help="Minimum seconds between requests per search engine (default: 1.0)")
+                        help="Min seconds between requests per search engine (default: 1.0)")
+    parser.add_argument("--region", default="",
+                        help="Region keyword appended to every search, e.g. 'india'")
     args = parser.parse_args()
 
     if args.workers > 10:
-        print(f"Warning: {args.workers} workers is aggressive and may trigger rate limiting.")
+        print(f"Warning: {args.workers} workers may trigger rate limiting.")
 
-    # Load brands
-    print(f"Reading brands from: {args.input}")
+    print(f"Reading brands from : {args.input}")
+    if args.region:
+        print(f"Region filter       : {args.region}")
+
     all_brands = read_brands(args.input, args.col)
     if not all_brands:
         print("No brands found in input file.")
         sys.exit(1)
-    print(f"Total brands in file : {len(all_brands):,}")
+    print(f"Total brands        : {len(all_brands):,}")
 
-    # Skip already-processed brands (resume support)
     done = load_already_done(args.output)
     brands_to_do = [b for b in all_brands if b not in done]
-    print(f"Already done         : {len(done):,}")
-    print(f"Remaining            : {len(brands_to_do):,}")
+    print(f"Already done        : {len(done):,}")
+    print(f"Remaining           : {len(brands_to_do):,}")
 
     if not brands_to_do:
         print("All brands already processed. Nothing to do.")
         sys.exit(0)
 
-    # Shared rate limiters — one per search engine (shared across all threads)
     ddg_rate  = RateLimiter(args.delay)
     goog_rate = RateLimiter(args.delay)
 
-    # Output CSV (append mode)
     out_fh, writer = open_output_csv(args.output)
     write_lock = threading.Lock()
 
@@ -339,36 +452,45 @@ def main():
     errors    = 0
     start     = time.monotonic()
 
+    # Confidence counters for final summary
+    conf_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, None: 0}
+
     print(f"\nStarting scrape with {args.workers} workers...\n")
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(scrape_brand, brand, ddg_rate, goog_rate): brand
+            pool.submit(scrape_brand, brand, ddg_rate, goog_rate, args.region): brand
             for brand in brands_to_do
         }
 
         for future in as_completed(futures):
             result = future.result()
             completed += 1
+
             if result["status"] == "not_found":
                 errors += 1
+            conf_counts[result.get("confidence")] = (
+                conf_counts.get(result.get("confidence"), 0) + 1
+            )
 
             with write_lock:
                 writer.writerow(result)
-                out_fh.flush()   # Ensure data is written even if we crash
+                out_fh.flush()
 
-            # Progress line
             elapsed  = time.monotonic() - start
             rate     = completed / elapsed if elapsed else 0
             eta_secs = (total - completed) / rate if rate else 0
             eta_str  = time.strftime("%H:%M:%S", time.gmtime(eta_secs))
             pct      = completed / total * 100
 
+            conf = result.get("confidence") or "-"
+            conf_tag = {"HIGH": "[H]", "MEDIUM": "[M]", "LOW": "[L]"}.get(conf, "[ ]")
             status_icon = "✓" if result["status"] == "ok" else (
                           "~" if result["status"] == "url_only" else "✗")
+
             print(
                 f"[{pct:5.1f}%] {completed:>{len(str(total))}}/{total}  "
-                f"ETA {eta_str}  {status_icon} {result['brand'][:40]}"
+                f"ETA {eta_str}  {status_icon}{conf_tag} {result['brand'][:35]}"
                 f"  →  {result['instagram_url'] or 'not found'}"
                 f"  {result['followers'] or ''}",
                 flush=True,
@@ -377,12 +499,15 @@ def main():
     out_fh.close()
 
     elapsed = time.monotonic() - start
-    ok      = completed - errors
-    print(f"\n{'─'*60}")
-    print(f"Done in {elapsed/60:.1f} min")
-    print(f"  Found     : {ok:,} / {total:,}")
-    print(f"  Not found : {errors:,}")
-    print(f"  Output    : {args.output}")
+    found   = completed - errors
+    print(f"\n{'─'*65}")
+    print(f"Done in {elapsed/60:.1f} min  |  Output: {args.output}")
+    print(f"  Found        : {found:,} / {total:,}")
+    print(f"  Not found    : {errors:,}")
+    print(f"  Confidence   →  HIGH: {conf_counts.get('HIGH',0):,}  "
+          f"MEDIUM: {conf_counts.get('MEDIUM',0):,}  "
+          f"LOW: {conf_counts.get('LOW',0):,}")
+    print(f"\nTip: open {args.output} in Excel and filter 'confidence' = LOW to review manually.")
 
 
 if __name__ == "__main__":
