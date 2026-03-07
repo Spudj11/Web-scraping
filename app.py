@@ -84,11 +84,23 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
             for brand in brands
         }
 
+        # Show immediate feedback so the UI doesn't look frozen
+        progress.progress(0, text=f"⏳ Submitted {total} brands to {workers} workers — waiting for first result…")
+        log_area.info(
+            f"Scraping **{total}** brands with **{workers}** parallel workers. "
+            f"Each brand makes several web requests — first result may take ~15–30 s. "
+            f"Results appear here as they complete."
+        )
+
+        start_time = time.time()
         done = 0
         for future in as_completed(futures):
             result = future.result()
             results.append(result)
             done += 1
+
+            elapsed = int(time.time() - start_time)
+            elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
 
             pct   = done / total
             brand = result["brand"]
@@ -103,7 +115,7 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
             if len(log_lines) > 50:          # keep last 50 lines visible
                 log_lines = log_lines[-50:]
 
-            progress.progress(pct, text=f"Scraped {done}/{total} — {brand}")
+            progress.progress(pct, text=f"Scraped {done}/{total} — {brand} (elapsed: {elapsed_str})")
             log_area.markdown("\n\n".join(log_lines))
 
     progress.progress(1.0, text="Done!")
