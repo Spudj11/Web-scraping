@@ -293,8 +293,12 @@ def _search_duckduckgo(query: str, rate_limiter: RateLimiter) -> dict | None:
         if resp.status_code == 429:
             return {"_blocked": True}
         resp.raise_for_status()
-    except requests.RequestException:
-        return None
+    except requests.exceptions.ProxyError:
+        return {"_network_error": "Proxy blocked the request"}
+    except requests.exceptions.ConnectionError as e:
+        return {"_network_error": f"Connection failed: {e}"}
+    except requests.RequestException as e:
+        return {"_network_error": str(e)}
     return _parse_ddg_blocks(BeautifulSoup(resp.text, "html.parser"), resp.text)
 
 
@@ -306,8 +310,12 @@ def _search_google(query: str, rate_limiter: RateLimiter) -> dict | None:
         if resp.status_code == 429:
             return {"_blocked": True}
         resp.raise_for_status()
-    except requests.RequestException:
-        return None
+    except requests.exceptions.ProxyError:
+        return {"_network_error": "Proxy blocked the request"}
+    except requests.exceptions.ConnectionError as e:
+        return {"_network_error": f"Connection failed: {e}"}
+    except requests.RequestException as e:
+        return {"_network_error": str(e)}
 
     soup = BeautifulSoup(resp.text, "html.parser")
     for result in soup.select("div.g, div[data-hveid]"):
@@ -656,24 +664,34 @@ def scrape_brand(
     }
 
     # --- Step 1: find Instagram profile ---
-    # Try multiple query strategies in order; stop at first hit
-    ig_result = None
+    ig_result    = None
+    last_net_err = None
     for ig_query in _build_ig_queries(brand_name, region):
         if ig_result:
             break
         for attempt in range(MAX_RETRIES):
             result = _search_duckduckgo(ig_query, ddg_rl)
+            if result and result.get("_network_error"):
+                last_net_err = result["_network_error"]
+                break  # network is down — no point retrying this query
             if result and result.get("_blocked"):
                 time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
                 continue
             if not result:
                 result = _search_google(ig_query, goog_rl)
+            if result and result.get("_network_error"):
+                last_net_err = result["_network_error"]
+                break
             if result and result.get("_blocked"):
                 time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
                 continue
             if result:
                 ig_result = result
                 break
+
+    # If the network is completely down, return a clear error status
+    if last_net_err and not ig_result:
+        return {**base, "status": "network_error", "confidence_reason": last_net_err}
 
     # --- Step 1b: direct handle guessing as last resort ---
     if not ig_result:

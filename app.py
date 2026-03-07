@@ -161,11 +161,13 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
     ddg_rl  = RateLimiter(delay)
     goog_rl = RateLimiter(delay)
 
-    results   = []
-    total     = len(brands)
-    progress  = st.progress(0, text="Starting…")
-    log_area  = st.empty()
-    log_lines = []
+    results      = []
+    total        = len(brands)
+    progress     = st.progress(0, text="Starting…")
+    log_area     = st.empty()
+    net_err_area = st.empty()
+    log_lines    = []
+    network_errors = 0
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -173,7 +175,6 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
             for brand in brands
         }
 
-        # Show immediate feedback so the UI doesn't look frozen
         progress.progress(0, text=f"⏳ Submitted {total} brands to {workers} workers — waiting for first result…")
         log_area.info(
             f"Scraping **{total}** brands with **{workers}** parallel workers. "
@@ -182,16 +183,16 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
         )
 
         start_time = time.time()
-        done = 0
+        done    = 0
         pending = set(futures.keys())
+
         while pending:
             done_set, pending = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
 
-            elapsed = int(time.time() - start_time)
+            elapsed     = int(time.time() - start_time)
             elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
 
             if not done_set:
-                # No brand finished in this 5-second window — just tick the progress bar
                 progress.progress(
                     done / total,
                     text=f"⏳ {done}/{total} complete — {len(pending)} in progress — {elapsed_str} elapsed",
@@ -203,16 +204,27 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
                 results.append(result)
                 done += 1
 
-                pct   = done / total
-                brand = result["brand"]
-                ig    = result.get("instagram_url") or "not found"
-                conf  = result.get("confidence") or "-"
-                status_icon = "✓" if result["status"] == "ok" else (
-                              "~" if result["status"] == "url_only" else "✗")
+                pct    = done / total
+                brand  = result["brand"]
+                status = result["status"]
+                ig     = result.get("instagram_url") or "not found"
+                conf   = result.get("confidence") or "-"
 
-                log_lines.append(
-                    f"{status_icon} [{conf}]  **{brand}**  →  {ig}"
-                )
+                if status == "network_error":
+                    network_errors += 1
+                    err_detail = result.get("confidence_reason", "unknown error")
+                    status_icon = "⚠"
+                    log_lines.append(f"⚠ [NET ERROR]  **{brand}**  →  {err_detail}")
+                    net_err_area.error(
+                        f"**Network error detected** — {network_errors}/{done} brands failed due to connection issues.\n\n"
+                        f"**Cause:** `{err_detail}`\n\n"
+                        f"This usually means your internet connection is blocked or a proxy is interfering. "
+                        f"Try running the app directly on your machine (not through a remote server)."
+                    )
+                else:
+                    status_icon = "✓" if status == "ok" else ("~" if status == "url_only" else "✗")
+                    log_lines.append(f"{status_icon} [{conf}]  **{brand}**  →  {ig}")
+
                 if len(log_lines) > 50:
                     log_lines = log_lines[-50:]
 
@@ -220,7 +232,16 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
                 log_area.markdown("\n\n".join(log_lines))
 
     progress.progress(1.0, text="Done!")
-    st.success(f"Finished! Scraped {total} brands.")
+    if network_errors == total:
+        st.error(
+            f"**All {total} brands failed with network errors.** "
+            f"The scraper cannot reach DuckDuckGo or Google from this machine. "
+            f"Check your internet connection or proxy settings."
+        )
+    elif network_errors > 0:
+        st.warning(f"Finished with {network_errors} network errors out of {total} brands.")
+    else:
+        st.success(f"Finished! Scraped {total} brands.")
 
     # ---------------------------------------------------------------------------
     # Results table + download
@@ -244,10 +265,12 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
     )
 
     # Quick summary
-    found = df[df["status"].isin(["ok", "url_only"])].shape[0]
-    col1, col2, col3, col4 = st.columns(4)
+    found    = df[df["status"].isin(["ok", "url_only"])].shape[0]
+    net_errs = (df["status"] == "network_error").sum()
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total", total)
     col2.metric("Found", found)
-    col3.metric("Not found", total - found)
+    col3.metric("Not found", total - found - int(net_errs))
+    col4.metric("Network errors", int(net_errs))
     high = (df["confidence"] == "HIGH").sum()
-    col4.metric("HIGH confidence", int(high))
+    col5.metric("HIGH confidence", int(high))
