@@ -20,9 +20,98 @@ from instagram_scraper import (
 )
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-st.set_page_config(page_title="Instagram Brand Scraper", page_icon="📸", layout="wide")
+st.set_page_config(page_title="Instagram Brand Finder", page_icon="🔍", layout="wide")
 
-st.title("📸 Instagram Brand Scraper")
+# ── Amazon corporate branding ────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ---- Base palette ---- */
+:root {
+    --amz-orange:  #FF9900;
+    --amz-navy:    #232F3E;
+    --amz-blue:    #146EB4;
+    --amz-bg:      #F7F8F8;
+    --amz-text:    #0F1111;
+    --amz-border:  #D5D9D9;
+}
+
+/* Page background */
+.stApp { background-color: var(--amz-bg); }
+
+/* ---- Top navbar ---- */
+[data-testid="stHeader"] { background-color: var(--amz-navy) !important; }
+
+/* ---- Sidebar ---- */
+[data-testid="stSidebar"] {
+    background-color: var(--amz-navy) !important;
+    border-right: 3px solid var(--amz-orange);
+}
+[data-testid="stSidebar"] * { color: #FFFFFF !important; }
+[data-testid="stSidebar"] .stSlider > div > div > div { background: var(--amz-orange) !important; }
+
+/* ---- Buttons ---- */
+.stButton > button[kind="primary"] {
+    background-color: var(--amz-orange) !important;
+    color: var(--amz-navy) !important;
+    border: none !important;
+    font-weight: 700 !important;
+    border-radius: 4px !important;
+    padding: 0.5rem 2rem !important;
+    font-size: 1rem !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background-color: #e68a00 !important;
+}
+
+/* ---- Download button ---- */
+.stDownloadButton > button {
+    background-color: var(--amz-blue) !important;
+    color: #FFFFFF !important;
+    border: none !important;
+    border-radius: 4px !important;
+    font-weight: 600 !important;
+}
+
+/* ---- Progress bar ---- */
+.stProgress > div > div > div { background-color: var(--amz-orange) !important; }
+
+/* ---- Metrics ---- */
+[data-testid="stMetricValue"] { color: var(--amz-navy) !important; font-weight: 700; }
+
+/* ---- File uploader ---- */
+[data-testid="stFileUploaderDropzone"] {
+    border: 2px dashed var(--amz-orange) !important;
+    border-radius: 6px !important;
+    background: #fff !important;
+}
+
+/* ---- Scrollbar ---- */
+::-webkit-scrollbar-thumb { background: var(--amz-orange); border-radius: 4px; }
+::-webkit-scrollbar { width: 8px; }
+</style>
+
+<!-- Amazon-style header bar -->
+<div style="
+    background: #232F3E;
+    padding: 10px 24px;
+    margin: -1rem -1rem 1.5rem -1rem;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    border-bottom: 3px solid #FF9900;
+">
+    <span style="font-size:2rem;">🔍</span>
+    <div>
+        <div style="color:#FF9900; font-size:1.4rem; font-weight:700; font-family:'Amazon Ember',Arial,sans-serif; letter-spacing:0.5px;">
+            Brand Instagram Finder
+        </div>
+        <div style="color:#ccc; font-size:0.8rem; font-family:Arial,sans-serif;">
+            Amazon Internal Tool &nbsp;|&nbsp; Seller & Brand Intelligence
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
 st.markdown("Upload a brand list, configure options, and download results as CSV.")
 
 # ---------------------------------------------------------------------------
