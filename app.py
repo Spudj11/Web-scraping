@@ -4,6 +4,7 @@ Run with:  streamlit run app.py
 """
 
 import io
+import tempfile
 import threading
 import time
 import queue
@@ -45,11 +46,12 @@ uploaded_file = st.file_uploader(
 
 brands = []
 if uploaded_file is not None:
-    # Save to a temp-like in-memory path so read_brands can parse it
+    # Save to a temp file so read_brands can parse it (works on Windows + Mac + Linux)
     suffix = "." + uploaded_file.name.rsplit(".", 1)[-1].lower()
-    tmp_path = f"/tmp/brands_upload{suffix}"
-    with open(tmp_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_file.write(uploaded_file.getvalue())
+    tmp_file.close()
+    tmp_path = tmp_file.name
 
     col_num = 1
     if suffix in (".csv", ".tsv"):
