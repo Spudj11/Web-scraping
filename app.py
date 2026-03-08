@@ -122,7 +122,7 @@ with st.sidebar:
     region = st.text_input("Region (optional)", placeholder="e.g. india")
     workers = st.slider("Parallel workers", min_value=1, max_value=10, value=3)
     delay = st.slider("Delay between requests (seconds)", min_value=0.5, max_value=5.0,
-                      value=1.5, step=0.5)
+                      value=2.5, step=0.5)
     skip_website = st.checkbox("Skip website analysis (faster)", value=False)
 
 # ---------------------------------------------------------------------------

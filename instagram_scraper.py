@@ -54,6 +54,10 @@ from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urlparse, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Thread-local storage for per-thread DDG sessions (each thread keeps its own
+# cookie jar so DDG sees consistent browser-like behaviour per session).
+_thread_local = threading.local()
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -212,6 +216,89 @@ def _is_valid_handle(handle: str) -> bool:
     return handle.lower() not in EXCLUDED_HANDLES
 
 
+def _get_session() -> requests.Session:
+    """
+    Return a thread-local requests.Session pre-warmed with DDG cookies.
+    Maintaining cookies across requests makes DDG treat us as a returning
+    browser session rather than a fresh bot, which significantly reduces
+    rate-limiting.
+    """
+    if not hasattr(_thread_local, "session"):
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        # Warm up: visit DDG homepage so the session collects consent cookies
+        try:
+            sess.get("https://duckduckgo.com/", timeout=10)
+        except Exception:
+            pass
+        _thread_local.session = sess
+    return _thread_local.session
+
+
+def _ddg_is_rate_limited(html: str) -> bool:
+    """
+    Return True when DuckDuckGo returned HTTP 200 but with an empty / CAPTCHA
+    / blocked page instead of real results.  DDG uses this pattern instead of
+    returning a 429 status code.
+    """
+    low = html.lower()
+    blocked_phrases = (
+        "no results", "no search results", "captcha",
+        "are you a robot", "enable javascript", "unusual traffic",
+        "we were unable",
+    )
+    if any(p in low for p in blocked_phrases):
+        return True
+    # Large page that contains zero result containers → almost certainly blocked
+    soup = BeautifulSoup(html, "html.parser")
+    has_results = bool(soup.select(
+        "div.result, div.results_links, div.web-result, article[data-testid]"
+    ))
+    return not has_results and len(html) > 3_000
+
+
+def _parse_ddg_lite(soup: BeautifulSoup, raw_html: str) -> dict | None:
+    """
+    Parse DuckDuckGo Lite results page (https://lite.duckduckgo.com/lite/).
+    Lite uses a simple table layout and sits behind a separate, more lenient
+    rate-limit quota than the main DDG HTML endpoint.
+    """
+    for link_tag in soup.select("a.result-link"):
+        href = link_tag.get("href", "")
+        url_match = INSTAGRAM_URL_PATTERN.search(href)
+        if not url_match:
+            url_match = INSTAGRAM_URL_PATTERN.search(link_tag.get_text())
+        if url_match and _is_valid_handle(url_match.group(1)):
+            instagram_url = f"https://www.instagram.com/{url_match.group(1)}/"
+            snippet = ""
+            row = link_tag.find_parent("tr")
+            if row:
+                next_row = row.find_next_sibling("tr")
+                if next_row:
+                    td = next_row.find(
+                        "td", class_=lambda c: c and "snippet" in c
+                    )
+                    if td:
+                        snippet = td.get_text(" ", strip=True)
+            fm = FOLLOWERS_PATTERN.search(snippet or raw_html)
+            return {
+                "instagram_url": instagram_url,
+                "followers":     fm.group(1) if fm else None,
+                "snippet":       snippet,
+            }
+
+    # Raw HTML fallback (catches JS-embedded URLs)
+    for m in INSTAGRAM_URL_PATTERN.finditer(raw_html):
+        if _is_valid_handle(m.group(1)):
+            fm = FOLLOWERS_PATTERN.search(raw_html)
+            return {
+                "instagram_url": f"https://www.instagram.com/{m.group(1)}/",
+                "followers":     fm.group(1) if fm else None,
+                "snippet":       "",
+            }
+    return None
+
+
 def _parse_ddg_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
     # DDG HTML structure varies; try multiple selector combos
     result_selectors = [
@@ -286,20 +373,42 @@ def _parse_ddg_blocks(soup: BeautifulSoup, raw_html: str) -> dict | None:
 
 
 def _search_duckduckgo(query: str, rate_limiter: RateLimiter) -> dict | None:
+    session = _get_session()
+
+    # ── Try main DDG HTML endpoint first ───────────────────────────────────
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     rate_limiter.wait()
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = session.get(url, headers=HEADERS, timeout=15)
         if resp.status_code == 429:
             return {"_blocked": True}
         resp.raise_for_status()
+        if _ddg_is_rate_limited(resp.text):
+            # DDG returned 200 but with an empty/CAPTCHA page → treat as blocked
+            return {"_blocked": True}
+        result = _parse_ddg_blocks(BeautifulSoup(resp.text, "html.parser"), resp.text)
+        if result:
+            return result
     except requests.exceptions.ProxyError:
         return {"_network_error": "Proxy blocked the request"}
     except requests.exceptions.ConnectionError as e:
         return {"_network_error": f"Connection failed: {e}"}
     except requests.RequestException as e:
         return {"_network_error": str(e)}
-    return _parse_ddg_blocks(BeautifulSoup(resp.text, "html.parser"), resp.text)
+
+    # ── Fallback: DDG Lite (separate rate-limit quota, simpler HTML) ────────
+    lite_url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+    rate_limiter.wait()
+    try:
+        resp = session.get(lite_url, headers=HEADERS, timeout=15)
+        if resp.status_code == 429:
+            return {"_blocked": True}
+        if resp.status_code == 200 and not _ddg_is_rate_limited(resp.text):
+            return _parse_ddg_lite(BeautifulSoup(resp.text, "html.parser"), resp.text)
+    except requests.RequestException:
+        pass
+
+    return None
 
 
 def _search_google(query: str, rate_limiter: RateLimiter) -> dict | None:
@@ -379,8 +488,8 @@ def _find_website_ddg(query: str, rate_limiter: RateLimiter) -> str | None:
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     rate_limiter.wait()
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
+        resp = _get_session().get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200 or _ddg_is_rate_limited(resp.text):
             return None
         resp.raise_for_status()
     except requests.RequestException:
@@ -423,8 +532,8 @@ def _search_on_site(brand_name: str, site: str, rate_limiter: RateLimiter) -> st
     url   = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     rate_limiter.wait()
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
+        resp = _get_session().get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200 or _ddg_is_rate_limited(resp.text):
             return None
         resp.raise_for_status()
     except requests.RequestException:
