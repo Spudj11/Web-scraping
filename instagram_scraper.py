@@ -554,6 +554,63 @@ def find_brand_website(brand_name: str, region: str, rate_limiter: RateLimiter) 
     return _find_website_ddg(query, rate_limiter)
 
 
+# Direct brand-search URL templates — used when DDG can't find the exact page.
+# Always returns a useful clickable link (brand's products on that marketplace).
+_MARKETPLACE_SEARCH_URLS = {
+    "amazon.in":    "https://www.amazon.in/s?k={q}",
+    "nykaa.com":    "https://www.nykaa.com/search/result/?q={q}&root=search&searchType=Manual",
+    "flipkart.com": "https://www.flipkart.com/search?q={q}",
+    "myntra.com":   "https://www.myntra.com/search?rawQuery={q}",
+}
+
+
+def _scrape_amazon_in_brand_page(brand_name: str) -> str | None:
+    """
+    Search Amazon.in directly (server-side rendered — no DDG needed).
+    Returns a brand store URL if found, otherwise the brand search URL.
+    Amazon.in search results are rendered server-side so this works without JS.
+    """
+    q = quote_plus(brand_name)
+    search_url = f"https://www.amazon.in/s?k={q}"
+    try:
+        resp = requests.get(search_url, headers=HEADERS, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            return search_url  # Return search URL as reliable fallback
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Look for brand store links (e.g. /stores/BrandName/page/XXXX)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/stores/" in href:
+                return href if href.startswith("http") else "https://www.amazon.in" + href
+        # Return search results URL (still shows brand's products)
+        return resp.url if resp.url.startswith("http") else search_url
+    except requests.RequestException:
+        return search_url
+
+
+def _scrape_nykaa_brand_page(brand_name: str) -> str | None:
+    """
+    Search Nykaa directly.
+    Returns a brand page URL if found in the HTML, otherwise the search URL.
+    """
+    q = quote_plus(brand_name)
+    search_url = f"https://www.nykaa.com/search/result/?q={q}&root=search&searchType=Manual"
+    slug = re.sub(r"[^a-z0-9]+", "-", brand_name.lower()).strip("-")
+    try:
+        resp = requests.get(search_url, headers=HEADERS, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            return search_url
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # Nykaa brand pages: /brands/{name}/c/{id}  or  /{name}-brand/b/{id}
+            if ("/brands/" in href or "-brand/b/" in href) and slug[:4] in href.lower():
+                return href if href.startswith("http") else "https://www.nykaa.com" + href
+        return search_url
+    except requests.RequestException:
+        return search_url
+
+
 def _search_on_site(brand_name: str, site: str, rate_limiter: RateLimiter) -> str | None:
     """
     Search DDG (with Lite fallback) for a brand on a specific marketplace domain.
@@ -569,13 +626,33 @@ def _search_on_site(brand_name: str, site: str, rate_limiter: RateLimiter) -> st
 
 def find_marketplace_urls(brand_name: str, rate_limiter: RateLimiter) -> dict:
     """
-    Search for the brand's listing page on each configured marketplace.
-    Returns a dict keyed by the CSV field name, e.g.:
-      {"nykaa_url": "https://...", "amazon_in_url": None, ...}
+    Find brand listing pages on each marketplace.
+    Strategy per marketplace:
+      1. DDG search — finds exact brand page when not rate-limited
+      2. Direct scrape — for Amazon.in and Nykaa (server-side rendered)
+      3. Direct search URL — guaranteed fallback, always returns a clickable link
     """
     results = {}
+    q = quote_plus(brand_name)
+
     for field, site in MARKETPLACE_TARGETS:
-        results[field] = _search_on_site(brand_name, site, rate_limiter)
+        # --- Layer 1: DDG (finds exact brand page) ---
+        found = _search_on_site(brand_name, site, rate_limiter)
+
+        # --- Layer 2: direct scrape for sites that support it ---
+        if not found:
+            if site == "amazon.in":
+                found = _scrape_amazon_in_brand_page(brand_name)
+            elif site == "nykaa.com":
+                found = _scrape_nykaa_brand_page(brand_name)
+
+        # --- Layer 3: guaranteed search URL fallback ---
+        if not found:
+            tmpl = _MARKETPLACE_SEARCH_URLS.get(site, "")
+            if tmpl:
+                found = tmpl.format(q=q)
+
+        results[field] = found
     return results
 
 
