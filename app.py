@@ -3,11 +3,8 @@ Streamlit web UI for the Instagram Brand Scraper.
 Run with:  streamlit run app.py
 """
 
-import io
 import tempfile
-import threading
 import time
-import queue
 
 import streamlit as st
 import pandas as pd
@@ -112,8 +109,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("Upload a brand list, configure options, and download results as CSV.")
-
 # ---------------------------------------------------------------------------
 # Sidebar — configuration
 # ---------------------------------------------------------------------------
@@ -126,33 +121,94 @@ with st.sidebar:
     skip_website = st.checkbox("Skip website analysis (faster)", value=False)
 
 # ---------------------------------------------------------------------------
-# File upload
+# Brand input — Upload file  OR  Paste brand names
 # ---------------------------------------------------------------------------
-uploaded_file = st.file_uploader(
-    "Upload your brand list (.txt, .csv, or .tsv)",
-    type=["txt", "csv", "tsv"],
-)
+st.markdown("### Add Brands")
+upload_tab, paste_tab = st.tabs(["📂 Upload File", "✏️ Paste Brand Names"])
 
-brands = []
-if uploaded_file is not None:
-    # Save to a temp file so read_brands can parse it (works on Windows + Mac + Linux)
-    suffix = "." + uploaded_file.name.rsplit(".", 1)[-1].lower()
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp_file.write(uploaded_file.getvalue())
-    tmp_file.close()
-    tmp_path = tmp_file.name
+file_brands  = []
+paste_brands = []
 
-    col_num = 1
-    if suffix in (".csv", ".tsv"):
-        col_num = st.number_input("Which column contains brand names? (1-based)", min_value=1,
-                                  max_value=20, value=1, step=1)
+with upload_tab:
+    uploaded_file = st.file_uploader(
+        "Upload a .txt, .csv, or .tsv brand list",
+        type=["txt", "csv", "tsv"],
+        label_visibility="collapsed",
+    )
+    if uploaded_file is not None:
+        suffix = "." + uploaded_file.name.rsplit(".", 1)[-1].lower()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(uploaded_file.getvalue())
+        tmp.close()
 
-    brands = read_brands(tmp_path, int(col_num))
-    st.success(f"Loaded **{len(brands):,}** brands from `{uploaded_file.name}`")
-    with st.expander("Preview brands"):
-        st.write(brands[:20])
-        if len(brands) > 20:
-            st.caption(f"… and {len(brands) - 20} more")
+        col_num = 1
+        if suffix in (".csv", ".tsv"):
+            col_num = st.number_input(
+                "Which column has brand names? (1-based)",
+                min_value=1, max_value=20, value=1, step=1,
+            )
+
+        file_brands = read_brands(tmp.name, int(col_num))
+        st.success(f"Loaded **{len(file_brands):,}** brands from `{uploaded_file.name}`")
+        with st.expander("Preview"):
+            st.write(file_brands[:20])
+            if len(file_brands) > 20:
+                st.caption(f"… and {len(file_brands) - 20} more")
+
+with paste_tab:
+    pasted_text = st.text_area(
+        "One brand name per line",
+        placeholder="mamaearth\nnykaa cosmetics\nboat lifestyle\nfoxtale\n...",
+        height=200,
+        label_visibility="collapsed",
+    )
+    if pasted_text.strip():
+        paste_brands = [
+            line.strip()
+            for line in pasted_text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if paste_brands:
+            st.success(f"**{len(paste_brands)}** brands ready")
+
+# Combine both sources, preserve order, deduplicate
+brands = list(dict.fromkeys(file_brands + paste_brands))
+if file_brands and paste_brands:
+    st.info(f"Using **{len(brands)}** brands total ({len(file_brands)} from file + {len(paste_brands)} pasted, duplicates removed).")
+
+# ---------------------------------------------------------------------------
+# Live results table helper
+# ---------------------------------------------------------------------------
+_CONF_BADGE = {"HIGH": "🟢 HIGH", "MEDIUM": "🟡 MEDIUM", "LOW": "🔴 LOW"}
+_LIVE_COLS  = ["Brand", "Status", "Confidence", "Instagram URL", "Followers",
+               "Website", "Amazon.in", "Nykaa"]
+
+
+def _build_live_df(results: list) -> pd.DataFrame:
+    rows = []
+    for r in results:
+        status = r.get("status", "")
+        if status == "network_error":
+            icon = "⚠️ error"
+        elif status == "ok":
+            icon = "✅ found"
+        elif status == "url_only":
+            icon = "🔗 url only"
+        else:
+            icon = "❌ not found"
+
+        rows.append({
+            "Brand":       r["brand"],
+            "Status":      icon,
+            "Confidence":  _CONF_BADGE.get(r.get("confidence") or "", r.get("confidence") or "—"),
+            "Instagram URL": r.get("instagram_url") or "",
+            "Followers":   r.get("followers") or "",
+            "Website":     r.get("website_url") or "",
+            "Amazon.in":   r.get("amazon_in_url") or "",
+            "Nykaa":       r.get("nykaa_url") or "",
+        })
+    return pd.DataFrame(rows, columns=_LIVE_COLS)
+
 
 # ---------------------------------------------------------------------------
 # Run scraper
@@ -161,13 +217,17 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
     ddg_rl  = RateLimiter(delay)
     goog_rl = RateLimiter(delay)
 
-    results      = []
-    total        = len(brands)
-    progress     = st.progress(0, text="Starting…")
-    log_area     = st.empty()
-    net_err_area = st.empty()
-    log_lines    = []
+    results        = []
+    total          = len(brands)
     network_errors = 0
+
+    progress     = st.progress(0, text="Starting…")
+    net_err_area = st.empty()
+    log_area     = st.empty()
+    log_lines    = []
+
+    st.markdown("#### Live Results")
+    live_table = st.empty()
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -175,11 +235,10 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
             for brand in brands
         }
 
-        progress.progress(0, text=f"⏳ Submitted {total} brands to {workers} workers — waiting for first result…")
+        progress.progress(0, text=f"⏳ Submitted {total} brands — waiting for first result…")
         log_area.info(
             f"Scraping **{total}** brands with **{workers}** parallel workers. "
-            f"Each brand makes several web requests — first result may take ~15–30 s. "
-            f"Results appear here as they complete."
+            f"Results appear as they complete."
         )
 
         start_time = time.time()
@@ -204,73 +263,84 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
                 results.append(result)
                 done += 1
 
-                pct    = done / total
-                brand  = result["brand"]
-                status = result["status"]
-                ig     = result.get("instagram_url") or "not found"
-                conf   = result.get("confidence") or "-"
+                brand_name = result["brand"]
+                status     = result["status"]
+                ig         = result.get("instagram_url") or "not found"
+                conf       = result.get("confidence") or "-"
 
                 if status == "network_error":
                     network_errors += 1
                     err_detail = result.get("confidence_reason", "unknown error")
-                    status_icon = "⚠"
-                    log_lines.append(f"⚠ [NET ERROR]  **{brand}**  →  {err_detail}")
+                    log_lines.append(f"⚠️ **[NET ERROR]** {brand_name} → {err_detail}")
                     net_err_area.error(
-                        f"**Network error detected** — {network_errors}/{done} brands failed due to connection issues.\n\n"
-                        f"**Cause:** `{err_detail}`\n\n"
-                        f"This usually means your internet connection is blocked or a proxy is interfering. "
-                        f"Try running the app directly on your machine (not through a remote server)."
+                        f"**Network error** — {network_errors}/{done} brands failed.\n\n"
+                        f"Cause: `{err_detail}`\n\n"
+                        f"Check your internet connection or proxy settings."
                     )
                 else:
-                    status_icon = "✓" if status == "ok" else ("~" if status == "url_only" else "✗")
-                    log_lines.append(f"{status_icon} [{conf}]  **{brand}**  →  {ig}")
+                    icon = "✅" if status == "ok" else ("🔗" if status == "url_only" else "❌")
+                    log_lines.append(f"{icon} **[{conf}]** {brand_name} → {ig}")
 
-                if len(log_lines) > 50:
-                    log_lines = log_lines[-50:]
+                if len(log_lines) > 60:
+                    log_lines = log_lines[-60:]
 
-                progress.progress(pct, text=f"Scraped {done}/{total} — {brand} (elapsed: {elapsed_str})")
-                log_area.markdown("\n\n".join(log_lines))
+            progress.progress(done / total, text=f"Scraped {done}/{total} — {elapsed_str} elapsed")
+            log_area.markdown("\n\n".join(log_lines))
+
+            # Update live table — ordered to match input brand list
+            brand_order = {b: i for i, b in enumerate(brands)}
+            sorted_results = sorted(results, key=lambda r: brand_order.get(r["brand"], 9999))
+            live_table.dataframe(
+                _build_live_df(sorted_results),
+                use_container_width=True,
+                column_config={
+                    "Instagram URL": st.column_config.LinkColumn("Instagram URL"),
+                    "Website":       st.column_config.LinkColumn("Website"),
+                    "Amazon.in":     st.column_config.LinkColumn("Amazon.in"),
+                    "Nykaa":         st.column_config.LinkColumn("Nykaa"),
+                },
+                hide_index=True,
+            )
 
     progress.progress(1.0, text="Done!")
+
     if network_errors == total:
         st.error(
             f"**All {total} brands failed with network errors.** "
-            f"The scraper cannot reach DuckDuckGo or Google from this machine. "
-            f"Check your internet connection or proxy settings."
+            f"The scraper cannot reach DuckDuckGo or Google from this machine."
         )
     elif network_errors > 0:
         st.warning(f"Finished with {network_errors} network errors out of {total} brands.")
     else:
-        st.success(f"Finished! Scraped {total} brands.")
+        st.success(f"Search Complete! Scraped {total} brands.")
 
     # ---------------------------------------------------------------------------
-    # Results table + download
+    # Summary metrics
     # ---------------------------------------------------------------------------
-    df = pd.DataFrame(results, columns=OUTPUT_FIELDS)
+    found    = sum(1 for r in results if r.get("status") in ("ok", "url_only"))
+    high     = sum(1 for r in results if r.get("confidence") == "HIGH")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total",          total)
+    c2.metric("Found",          found)
+    c3.metric("Not found",      total - found - network_errors)
+    c4.metric("Network errors", network_errors)
+    c5.metric("HIGH confidence", high)
 
-    # Reorder to match input brand list
+    # ---------------------------------------------------------------------------
+    # Full results download
+    # ---------------------------------------------------------------------------
+    st.markdown("#### Full Results (all columns)")
+    df_full = pd.DataFrame(results, columns=OUTPUT_FIELDS)
     brand_order = {b: i for i, b in enumerate(brands)}
-    df["_order"] = df["brand"].map(brand_order)
-    df = df.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+    df_full["_order"] = df_full["brand"].map(brand_order)
+    df_full = df_full.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
-    st.subheader("Results")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df_full, use_container_width=True)
 
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    csv_bytes = df_full.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="⬇️ Download results as CSV",
+        label="⬇️ Download full results as CSV",
         data=csv_bytes,
         file_name="instagram_results.csv",
         mime="text/csv",
     )
-
-    # Quick summary
-    found    = df[df["status"].isin(["ok", "url_only"])].shape[0]
-    net_errs = (df["status"] == "network_error").sum()
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total", total)
-    col2.metric("Found", found)
-    col3.metric("Not found", total - found - int(net_errs))
-    col4.metric("Network errors", int(net_errs))
-    high = (df["confidence"] == "HIGH").sum()
-    col5.metric("HIGH confidence", int(high))
