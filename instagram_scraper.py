@@ -483,36 +483,67 @@ def _decode_ddg_href(href: str) -> str | None:
     return None
 
 
-def _find_website_ddg(query: str, rate_limiter: RateLimiter) -> str | None:
-    """Search DDG and return first non-marketplace URL."""
-    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-    rate_limiter.wait()
-    try:
-        resp = _get_session().get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200 or _ddg_is_rate_limited(resp.text):
-            return None
-        resp.raise_for_status()
-    except requests.RequestException:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for result in soup.select("div.result, div.results_links"):
-        link_tag = result.select_one("a.result__a")
-        if not link_tag:
-            continue
-        real_url = _decode_ddg_href(link_tag.get("href", ""))
-        if real_url and not _is_marketplace_url(real_url):
-            return real_url
-
-        # Fallback: display URL text (e.g. "mamaearth.in › shop")
+def _first_non_marketplace_url(soup: BeautifulSoup) -> str | None:
+    """Extract the first non-marketplace URL from a DDG results page (main or Lite)."""
+    for result in soup.select("div.result, div.results_links, tr"):
+        # Main DDG link
+        link_tag = result.select_one("a.result__a, a.result-link")
+        if link_tag:
+            real_url = _decode_ddg_href(link_tag.get("href", ""))
+            if real_url and real_url.startswith("http") and not _is_marketplace_url(real_url):
+                return real_url
+        # Display-text URL span (e.g. "mamaearth.in › shop")
         url_span = result.select_one("span.result__url, div.result__url")
         if url_span:
             display = url_span.get_text(strip=True).split("›")[0].strip()
             if display and "." in display and not _is_marketplace_url(display):
-                # Reconstruct full URL from display domain
-                if not display.startswith("http"):
-                    display = "https://" + display
-                return display
+                return display if display.startswith("http") else "https://" + display
+    return None
+
+
+def _first_site_url(soup: BeautifulSoup, site: str) -> str | None:
+    """Extract the first URL belonging to *site* from a DDG results page (main or Lite)."""
+    for result in soup.select("div.result, div.results_links, tr"):
+        link_tag = result.select_one("a.result__a, a.result-link")
+        if link_tag:
+            real_url = _decode_ddg_href(link_tag.get("href", ""))
+            if real_url and site in real_url:
+                return real_url
+        url_span = result.select_one("span.result__url, div.result__url")
+        if url_span:
+            display = url_span.get_text(strip=True).split("›")[0].strip()
+            if site in display:
+                return display if display.startswith("http") else "https://" + display
+    return None
+
+
+def _ddg_fetch_both(query: str, rate_limiter: RateLimiter):
+    """
+    Try DDG main endpoint, then DDG Lite if the first is rate-limited.
+    Yields each (soup) in order so callers can parse whichever succeeds.
+    """
+    session = _get_session()
+    for url in (
+        f"https://duckduckgo.com/html/?q={quote_plus(query)}",
+        f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}",
+    ):
+        rate_limiter.wait()
+        try:
+            resp = session.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code in (403, 429) or _ddg_is_rate_limited(resp.text):
+                continue
+            if resp.status_code == 200:
+                yield BeautifulSoup(resp.text, "html.parser")
+        except requests.RequestException:
+            continue
+
+
+def _find_website_ddg(query: str, rate_limiter: RateLimiter) -> str | None:
+    """Search DDG (with Lite fallback) and return first non-marketplace URL."""
+    for soup in _ddg_fetch_both(query, rate_limiter):
+        result = _first_non_marketplace_url(soup)
+        if result:
+            return result
     return None
 
 
@@ -525,35 +556,14 @@ def find_brand_website(brand_name: str, region: str, rate_limiter: RateLimiter) 
 
 def _search_on_site(brand_name: str, site: str, rate_limiter: RateLimiter) -> str | None:
     """
-    Search DDG for a brand on a specific marketplace domain.
+    Search DDG (with Lite fallback) for a brand on a specific marketplace domain.
     Returns the first result URL that belongs to that domain.
     """
     query = f'"{brand_name}" site:{site}'
-    url   = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-    rate_limiter.wait()
-    try:
-        resp = _get_session().get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200 or _ddg_is_rate_limited(resp.text):
-            return None
-        resp.raise_for_status()
-    except requests.RequestException:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for result in soup.select("div.result, div.results_links"):
-        link_tag = result.select_one("a.result__a")
-        if not link_tag:
-            continue
-        real_url = _decode_ddg_href(link_tag.get("href", ""))
-        if real_url and site in real_url:
-            return real_url
-
-        # Fallback: display URL span
-        url_span = result.select_one("span.result__url, div.result__url")
-        if url_span:
-            display = url_span.get_text(strip=True).split("›")[0].strip()
-            if site in display:
-                return "https://" + display if not display.startswith("http") else display
+    for soup in _ddg_fetch_both(query, rate_limiter):
+        result = _first_site_url(soup, site)
+        if result:
+            return result
     return None
 
 

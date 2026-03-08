@@ -80,29 +80,18 @@ st.markdown("""
     gap: 20px;
     border-bottom: 3px solid #FF9900;
 ">
-    <!-- Amazon wordmark + smile SVG logo -->
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 52" width="140" height="52"
-         style="flex-shrink:0">
-        <text x="3" y="32" font-family="'Arial Black',Arial,sans-serif"
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 52" width="140" height="52" style="flex-shrink:0">
+        <text x="3" y="32" font-family="Arial Black,Arial,sans-serif"
               font-weight="900" font-size="30" fill="#FFFFFF" letter-spacing="-1">amazon</text>
         <path d="M12 43 C42 55 96 55 126 43"
               stroke="#FF9900" stroke-width="4.5" fill="none" stroke-linecap="round"/>
         <polygon points="122,39 131,44 122,48" fill="#FF9900"/>
     </svg>
-
-    <!-- Divider -->
-    <div style="width:2px; height:40px; background:#FF9900; opacity:0.5;"></div>
-
-    <!-- Tool title -->
-    <div>
-        <div style="color:#FF9900; font-size:1.35rem; font-weight:700;
-                    font-family:'Amazon Ember',Arial,sans-serif; letter-spacing:0.4px;">
-            Brand Instagram Finder
-        </div>
-        <div style="color:#aaa; font-size:0.78rem; font-family:Arial,sans-serif; margin-top:2px;">
-            Amazon Internal Tool &nbsp;·&nbsp; Seller &amp; Brand Intelligence
-        </div>
-    </div>
+    <span style="display:inline-block; width:2px; height:40px; background:#FF9900; opacity:0.5; flex-shrink:0;"></span>
+    <span>
+        <span style="display:block; color:#FF9900; font-size:1.35rem; font-weight:700; font-family:Arial,sans-serif; letter-spacing:0.4px;">Brand Instagram Finder</span>
+        <span style="display:block; color:#aaa; font-size:0.78rem; font-family:Arial,sans-serif; margin-top:2px;">Amazon Internal Tool &nbsp;&middot;&nbsp; Seller &amp; Brand Intelligence</span>
+    </span>
 </div>
 """, unsafe_allow_html=True)
 
