@@ -19,26 +19,18 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 st.set_page_config(page_title="Instagram Brand Finder", page_icon="🔍", layout="wide")
 
-# ── Amazon corporate branding ────────────────────────────────────────────────
+# ── Branding + CSS ────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ---- Base palette ---- */
 :root {
-    --amz-orange:  #FF9900;
-    --amz-navy:    #232F3E;
-    --amz-blue:    #146EB4;
-    --amz-bg:      #F7F8F8;
-    --amz-text:    #0F1111;
-    --amz-border:  #D5D9D9;
+    --amz-orange: #FF9900;
+    --amz-navy:   #232F3E;
+    --amz-blue:   #146EB4;
+    --amz-bg:     #F7F8F8;
 }
-
-/* Page background */
 .stApp { background-color: var(--amz-bg); }
-
-/* ---- Top navbar ---- */
 [data-testid="stHeader"] { background-color: var(--amz-navy) !important; }
 
-/* ---- Sidebar ---- */
 [data-testid="stSidebar"] {
     background-color: var(--amz-navy) !important;
     border-right: 3px solid var(--amz-orange);
@@ -46,7 +38,6 @@ st.markdown("""
 [data-testid="stSidebar"] * { color: #FFFFFF !important; }
 [data-testid="stSidebar"] .stSlider > div > div > div { background: var(--amz-orange) !important; }
 
-/* ---- Buttons ---- */
 .stButton > button[kind="primary"] {
     background-color: var(--amz-orange) !important;
     color: var(--amz-navy) !important;
@@ -56,11 +47,8 @@ st.markdown("""
     padding: 0.5rem 2rem !important;
     font-size: 1rem !important;
 }
-.stButton > button[kind="primary"]:hover {
-    background-color: #e68a00 !important;
-}
+.stButton > button[kind="primary"]:hover { background-color: #e68a00 !important; }
 
-/* ---- Download button ---- */
 .stDownloadButton > button {
     background-color: var(--amz-blue) !important;
     color: #FFFFFF !important;
@@ -69,41 +57,50 @@ st.markdown("""
     font-weight: 600 !important;
 }
 
-/* ---- Progress bar ---- */
 .stProgress > div > div > div { background-color: var(--amz-orange) !important; }
-
-/* ---- Metrics ---- */
 [data-testid="stMetricValue"] { color: var(--amz-navy) !important; font-weight: 700; }
 
-/* ---- File uploader ---- */
 [data-testid="stFileUploaderDropzone"] {
     border: 2px dashed var(--amz-orange) !important;
     border-radius: 6px !important;
     background: #fff !important;
 }
 
-/* ---- Scrollbar ---- */
 ::-webkit-scrollbar-thumb { background: var(--amz-orange); border-radius: 4px; }
 ::-webkit-scrollbar { width: 8px; }
 </style>
 
-<!-- Amazon-style header bar -->
+<!-- Header bar with Amazon logo -->
 <div style="
     background: #232F3E;
     padding: 10px 24px;
     margin: -1rem -1rem 1.5rem -1rem;
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 20px;
     border-bottom: 3px solid #FF9900;
 ">
-    <span style="font-size:2rem;">🔍</span>
+    <!-- Amazon wordmark + smile SVG logo -->
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 52" width="140" height="52"
+         style="flex-shrink:0">
+        <text x="3" y="32" font-family="'Arial Black',Arial,sans-serif"
+              font-weight="900" font-size="30" fill="#FFFFFF" letter-spacing="-1">amazon</text>
+        <path d="M12 43 C42 55 96 55 126 43"
+              stroke="#FF9900" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+        <polygon points="122,39 131,44 122,48" fill="#FF9900"/>
+    </svg>
+
+    <!-- Divider -->
+    <div style="width:2px; height:40px; background:#FF9900; opacity:0.5;"></div>
+
+    <!-- Tool title -->
     <div>
-        <div style="color:#FF9900; font-size:1.4rem; font-weight:700; font-family:'Amazon Ember',Arial,sans-serif; letter-spacing:0.5px;">
+        <div style="color:#FF9900; font-size:1.35rem; font-weight:700;
+                    font-family:'Amazon Ember',Arial,sans-serif; letter-spacing:0.4px;">
             Brand Instagram Finder
         </div>
-        <div style="color:#ccc; font-size:0.8rem; font-family:Arial,sans-serif;">
-            Amazon Internal Tool &nbsp;|&nbsp; Seller & Brand Intelligence
+        <div style="color:#aaa; font-size:0.78rem; font-family:Arial,sans-serif; margin-top:2px;">
+            Amazon Internal Tool &nbsp;·&nbsp; Seller &amp; Brand Intelligence
         </div>
     </div>
 </div>
@@ -114,10 +111,9 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
-    region = st.text_input("Region (optional)", placeholder="e.g. india")
-    workers = st.slider("Parallel workers", min_value=1, max_value=10, value=3)
-    delay = st.slider("Delay between requests (seconds)", min_value=0.5, max_value=5.0,
-                      value=2.5, step=0.5)
+    region       = st.text_input("Region (optional)", placeholder="e.g. india")
+    workers      = st.slider("Parallel workers",               min_value=1,   max_value=10,  value=3)
+    delay        = st.slider("Delay between requests (sec)",   min_value=0.5, max_value=5.0, value=2.5, step=0.5)
     skip_website = st.checkbox("Skip website analysis (faster)", value=False)
 
 # ---------------------------------------------------------------------------
@@ -174,14 +170,34 @@ with paste_tab:
 # Combine both sources, preserve order, deduplicate
 brands = list(dict.fromkeys(file_brands + paste_brands))
 if file_brands and paste_brands:
-    st.info(f"Using **{len(brands)}** brands total ({len(file_brands)} from file + {len(paste_brands)} pasted, duplicates removed).")
+    st.info(
+        f"Using **{len(brands)}** brands total "
+        f"({len(file_brands)} from file + {len(paste_brands)} pasted, duplicates removed)."
+    )
 
 # ---------------------------------------------------------------------------
-# Live results table helper
+# Live results table helpers
 # ---------------------------------------------------------------------------
 _CONF_BADGE = {"HIGH": "🟢 HIGH", "MEDIUM": "🟡 MEDIUM", "LOW": "🔴 LOW"}
-_LIVE_COLS  = ["Brand", "Status", "Confidence", "Instagram URL", "Followers",
-               "Website", "Amazon.in", "Nykaa"]
+
+_LIVE_COLS = [
+    "Brand", "Status", "Confidence", "Site Confirms",
+    "Instagram URL", "Followers",
+    "Website", "Amazon.in", "Nykaa",
+]
+
+
+def _site_confirms_label(r: dict) -> str:
+    """Human-readable label for the website cross-check field."""
+    val = r.get("website_confirms_instagram")
+    if val == "yes":
+        return "✅ Confirmed"
+    if val and val.startswith("no"):
+        # val looks like "no (website says @handle)"
+        return f"⚠️ {val}"
+    if val == "not_checked":
+        return "🔍 No IG link on site"
+    return "—"
 
 
 def _build_live_df(results: list) -> pd.DataFrame:
@@ -198,17 +214,27 @@ def _build_live_df(results: list) -> pd.DataFrame:
             icon = "❌ not found"
 
         rows.append({
-            "Brand":       r["brand"],
-            "Status":      icon,
-            "Confidence":  _CONF_BADGE.get(r.get("confidence") or "", r.get("confidence") or "—"),
-            "Instagram URL": r.get("instagram_url") or "",
-            "Followers":   r.get("followers") or "",
-            "Website":     r.get("website_url") or "",
-            "Amazon.in":   r.get("amazon_in_url") or "",
-            "Nykaa":       r.get("nykaa_url") or "",
+            "Brand":         r["brand"],
+            "Status":        icon,
+            "Confidence":    _CONF_BADGE.get(r.get("confidence") or "", r.get("confidence") or "—"),
+            "Site Confirms": _site_confirms_label(r),
+            # Use None for missing URLs — LinkColumn only renders valid http:// strings;
+            # empty strings "" cause blank non-clickable cells in Streamlit.
+            "Instagram URL": r.get("instagram_url") or None,
+            "Followers":     r.get("followers") or "—",
+            "Website":       r.get("website_url") or None,
+            "Amazon.in":     r.get("amazon_in_url") or None,
+            "Nykaa":         r.get("nykaa_url") or None,
         })
     return pd.DataFrame(rows, columns=_LIVE_COLS)
 
+
+_LINK_COLS = {
+    "Instagram URL": st.column_config.LinkColumn("Instagram URL", display_text="Open ↗"),
+    "Website":       st.column_config.LinkColumn("Website",       display_text="Open ↗"),
+    "Amazon.in":     st.column_config.LinkColumn("Amazon.in",     display_text="Open ↗"),
+    "Nykaa":         st.column_config.LinkColumn("Nykaa",         display_text="Open ↗"),
+}
 
 # ---------------------------------------------------------------------------
 # Run scraper
@@ -220,6 +246,7 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
     results        = []
     total          = len(brands)
     network_errors = 0
+    brand_order    = {b: i for i, b in enumerate(brands)}
 
     progress     = st.progress(0, text="Starting…")
     net_err_area = st.empty()
@@ -287,18 +314,12 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
             progress.progress(done / total, text=f"Scraped {done}/{total} — {elapsed_str} elapsed")
             log_area.markdown("\n\n".join(log_lines))
 
-            # Update live table — ordered to match input brand list
-            brand_order = {b: i for i, b in enumerate(brands)}
+            # Rebuild live table in input order
             sorted_results = sorted(results, key=lambda r: brand_order.get(r["brand"], 9999))
             live_table.dataframe(
                 _build_live_df(sorted_results),
                 use_container_width=True,
-                column_config={
-                    "Instagram URL": st.column_config.LinkColumn("Instagram URL"),
-                    "Website":       st.column_config.LinkColumn("Website"),
-                    "Amazon.in":     st.column_config.LinkColumn("Amazon.in"),
-                    "Nykaa":         st.column_config.LinkColumn("Nykaa"),
-                },
+                column_config=_LINK_COLS,
                 hide_index=True,
             )
 
@@ -312,30 +333,38 @@ if brands and st.button("🚀 Start Scraping", type="primary"):
     elif network_errors > 0:
         st.warning(f"Finished with {network_errors} network errors out of {total} brands.")
     else:
-        st.success(f"Search Complete! Scraped {total} brands.")
+        st.success("Search Complete!")
 
-    # ---------------------------------------------------------------------------
-    # Summary metrics
-    # ---------------------------------------------------------------------------
-    found    = sum(1 for r in results if r.get("status") in ("ok", "url_only"))
-    high     = sum(1 for r in results if r.get("confidence") == "HIGH")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total",          total)
-    c2.metric("Found",          found)
-    c3.metric("Not found",      total - found - network_errors)
-    c4.metric("Network errors", network_errors)
+    # ── Summary metrics ──────────────────────────────────────────────────────
+    found     = sum(1 for r in results if r.get("status") in ("ok", "url_only"))
+    high      = sum(1 for r in results if r.get("confidence") == "HIGH")
+    confirmed = sum(1 for r in results if r.get("website_confirms_instagram") == "yes")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total",           total)
+    c2.metric("Found",           found)
+    c3.metric("Not found",       total - found - network_errors)
+    c4.metric("Network errors",  network_errors)
     c5.metric("HIGH confidence", high)
+    c6.metric("Site confirmed",  confirmed)
 
-    # ---------------------------------------------------------------------------
-    # Full results download
-    # ---------------------------------------------------------------------------
+    # ── Full results table + CSV download ────────────────────────────────────
     st.markdown("#### Full Results (all columns)")
     df_full = pd.DataFrame(results, columns=OUTPUT_FIELDS)
-    brand_order = {b: i for i, b in enumerate(brands)}
     df_full["_order"] = df_full["brand"].map(brand_order)
     df_full = df_full.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
-    st.dataframe(df_full, use_container_width=True)
+    st.dataframe(
+        df_full,
+        use_container_width=True,
+        column_config={
+            "instagram_url": st.column_config.LinkColumn("instagram_url", display_text="Open ↗"),
+            "website_url":   st.column_config.LinkColumn("website_url",   display_text="Open ↗"),
+            "amazon_in_url": st.column_config.LinkColumn("amazon_in_url", display_text="Open ↗"),
+            "nykaa_url":     st.column_config.LinkColumn("nykaa_url",     display_text="Open ↗"),
+            "flipkart_url":  st.column_config.LinkColumn("flipkart_url",  display_text="Open ↗"),
+            "myntra_url":    st.column_config.LinkColumn("myntra_url",    display_text="Open ↗"),
+        },
+    )
 
     csv_bytes = df_full.to_csv(index=False).encode("utf-8")
     st.download_button(
