@@ -380,7 +380,7 @@ def _search_duckduckgo(query: str, rate_limiter: RateLimiter) -> dict | None:
     rate_limiter.wait()
     try:
         resp = session.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code == 429:
+        if resp.status_code in (403, 429):
             return {"_blocked": True}
         resp.raise_for_status()
         if _ddg_is_rate_limited(resp.text):
@@ -416,7 +416,7 @@ def _search_google(query: str, rate_limiter: RateLimiter) -> dict | None:
     rate_limiter.wait()
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code == 429:
+        if resp.status_code in (403, 429):
             return {"_blocked": True}
         resp.raise_for_status()
     except requests.exceptions.ProxyError:
