@@ -547,11 +547,83 @@ def _find_website_ddg(query: str, rate_limiter: RateLimiter) -> str | None:
     return None
 
 
-def find_brand_website(brand_name: str, region: str, rate_limiter: RateLimiter) -> str | None:
-    """Return the brand's D2C / ecommerce website URL, or None if not found."""
+def _extract_website_from_instagram(instagram_url: str) -> str | None:
+    """
+    Fetch the brand's Instagram profile page and extract their website link.
+    Instagram embeds profile data as JSON in the page source including
+    the 'external_url' field that brands set as their bio link.
+    """
+    try:
+        resp = requests.get(instagram_url, headers=HEADERS, timeout=10, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        for pattern in (
+            r'"external_url"\s*:\s*"(https?://[^"]+)"',
+            r'"website"\s*:\s*"(https?://[^"]+)"',
+        ):
+            m = re.search(pattern, resp.text)
+            if m:
+                url = m.group(1).replace("\\u0026", "&").replace("\\/", "/")
+                if url and "instagram.com" not in url and not _is_marketplace_url(url):
+                    return url
+    except requests.RequestException:
+        pass
+    return None
+
+
+def _guess_brand_website(brand_name: str) -> str | None:
+    """
+    Try common domain patterns to find the brand's own website directly,
+    without relying on any search engine.
+    Tries .in before .com since most Indian D2C brands prefer .in domains.
+    """
+    slug = re.sub(r"[^a-z0-9]", "", brand_name.lower())
+    if len(slug) < 3:
+        return None
+    for url in (
+        f"https://www.{slug}.in",
+        f"https://www.{slug}.com",
+        f"https://{slug}.in",
+        f"https://{slug}.com",
+    ):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=5,
+                                allow_redirects=True, verify=False)
+            if resp.status_code == 200 and not _is_marketplace_url(resp.url):
+                return resp.url
+        except requests.RequestException:
+            continue
+    return None
+
+
+def find_brand_website(
+    brand_name: str,
+    region: str,
+    rate_limiter: RateLimiter,
+    ig_url: str | None = None,
+) -> str | None:
+    """
+    Return the brand's D2C / ecommerce website URL using three methods in order:
+      1. DDG search (with Lite fallback) — finds exact website when not rate-limited
+      2. Instagram bio extraction — brand's profile link field (no search engine needed)
+      3. Domain guessing — try {brand}.in and {brand}.com directly
+    """
     suffix = f" {region}" if region else ""
     query  = f"{brand_name}{suffix} official website"
-    return _find_website_ddg(query, rate_limiter)
+
+    # Method 1: DDG
+    result = _find_website_ddg(query, rate_limiter)
+    if result:
+        return result
+
+    # Method 2: Instagram bio
+    if ig_url:
+        result = _extract_website_from_instagram(ig_url)
+        if result:
+            return result
+
+    # Method 3: Direct domain guess
+    return _guess_brand_website(brand_name)
 
 
 # Direct brand-search URL templates — used when DDG can't find the exact page.
@@ -914,43 +986,46 @@ def scrape_brand(
     }
 
     if skip_website:
+        # Still run marketplace search even when website analysis is skipped
+        row.update(find_marketplace_urls(brand_name, ddg_rl))
         return row
 
-    # --- Step 2: find D2C website ---
-    website_url = find_brand_website(brand_name, region, ddg_rl)
-    if not website_url:
-        return row
+    # --- Step 2: find D2C website (three methods — DDG, Instagram bio, domain guess) ---
+    website_url = find_brand_website(
+        brand_name, region, ddg_rl,
+        ig_url=ig_result.get("instagram_url"),
+    )
 
-    row["website_url"] = website_url
+    if website_url:
+        row["website_url"] = website_url
 
-    # --- Step 3: analyse the website ---
-    site_info = analyze_website(website_url)
-    row["platform"]      = site_info["platform"]
-    row["shopify_store"] = site_info["shopify_store"]
+        # --- Step 3: analyse the website ---
+        site_info = analyze_website(website_url)
+        row["platform"]      = site_info["platform"]
+        row["shopify_store"] = site_info["shopify_store"]
 
-    handles = site_info["instagram_handles"]
-    if handles:
-        row["instagram_on_website"] = handles[0]   # highest-priority handle on the page
+        handles = site_info["instagram_handles"]
+        if handles:
+            row["instagram_on_website"] = handles[0]
 
-        found_handle   = ig_result["instagram_url"].rstrip("/").split("/")[-1].lower()
-        website_handle = handles[0].lower()
+            found_handle   = ig_result["instagram_url"].rstrip("/").split("/")[-1].lower()
+            website_handle = handles[0].lower()
 
-        if found_handle == website_handle:
-            # Website confirms the Instagram we found — upgrade confidence to HIGH
-            row["website_confirms_instagram"] = "yes"
-            row["confidence"]        = "HIGH"
-            row["confidence_reason"] = (conf_reason + "; confirmed by brand website").lstrip("; ")
+            if found_handle == website_handle:
+                row["website_confirms_instagram"] = "yes"
+                row["confidence"]        = "HIGH"
+                row["confidence_reason"] = (conf_reason + "; confirmed by brand website").lstrip("; ")
+            else:
+                row["website_confirms_instagram"] = f"no (website says @{website_handle})"
+                row["instagram_url"]     = f"https://www.instagram.com/{website_handle}/"
+                row["confidence"]        = "HIGH"
+                row["confidence_reason"] = f"overridden by brand website (@{website_handle})"
         else:
-            # Website links to a DIFFERENT Instagram — this is the strongest
-            # signal that we have the wrong account. Switch to the website's handle.
-            row["website_confirms_instagram"] = f"no (website says @{website_handle})"
-            row["instagram_url"]     = f"https://www.instagram.com/{website_handle}/"
-            row["confidence"]        = "HIGH"
-            row["confidence_reason"] = f"overridden by brand website (@{website_handle})"
+            row["website_confirms_instagram"] = "not_checked"
     else:
         row["website_confirms_instagram"] = "not_checked"
 
-    # --- Step 4: find marketplace listing pages ---
+    # --- Step 4: find marketplace listing pages (ALWAYS runs — never skipped) ---
     row.update(find_marketplace_urls(brand_name, ddg_rl))
 
     return row
